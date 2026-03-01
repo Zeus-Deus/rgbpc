@@ -57,12 +57,17 @@ pub struct App {
     selected_color_index: usize,
     custom_hex_input: String,
     input_active: bool,
+    is_omarchy: bool,
 }
 
 impl App {
     pub fn new() -> Self {
         let devices = openrgb::list_devices().unwrap_or_default();
         let config = AppConfig::load();
+
+        let mut omarchy_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+        omarchy_dir.push(".config/omarchy");
+        let is_omarchy = omarchy_dir.is_dir();
 
         let mut hex_color = String::from("7aa2f7");
         let mut theme_path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
@@ -89,13 +94,18 @@ impl App {
             config,
             devices,
             selected_index: 0,
-            status_msg: Arc::new(Mutex::new("Press 's' toggle Sync, 'Enter'/'Space' toggle Device, 'c' manual Color, 't' Force sync, 'r' rainbow, 'q' quit.".to_string())),
+            status_msg: Arc::new(Mutex::new(if is_omarchy {
+                "Press 's' toggle Sync, 'Enter'/'Space' toggle Device, 'c' manual Color, 't' Force sync, 'r' rainbow, 'q' quit.".to_string()
+            } else {
+                "Press 'Enter'/'Space' toggle Device, 'c' manual Color, 'r' rainbow, 'o' off, 'q' quit.".to_string()
+            })),
             theme_color: hex_color,
             is_syncing: false,
             mode: AppMode::Normal,
             selected_color_index: 0,
             custom_hex_input: String::new(),
             input_active: false,
+            is_omarchy,
         }
     }
 
@@ -152,9 +162,9 @@ impl App {
                                 KeyCode::Down | KeyCode::Char('j') => self.next(),
                                 KeyCode::Up | KeyCode::Char('k') => self.previous(),
                                 KeyCode::Enter | KeyCode::Char(' ') => self.toggle_current(),
-                                KeyCode::Char('s') => self.toggle_sync(),
+                                KeyCode::Char('s') if self.is_omarchy => self.toggle_sync(),
                                 KeyCode::Char('c') => self.open_color_picker(),
-                                KeyCode::Char('t') => self.force_sync(&tx),
+                                KeyCode::Char('t') if self.is_omarchy => self.force_sync(&tx),
                                 KeyCode::Char('o') => self.force_off(),
                                 KeyCode::Char('r') => self.force_rainbow(),
                                 _ => {}
@@ -498,13 +508,14 @@ impl App {
     }
 
     fn ui(&self, f: &mut ratatui::Frame) {
+        let settings_height = if self.is_omarchy { 4 } else { 0 };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(2)
             .constraints(
                 [
                     Constraint::Length(3),
-                    Constraint::Length(4),
+                    Constraint::Length(settings_height),
                     Constraint::Min(5),
                     Constraint::Length(4),
                 ]
@@ -546,7 +557,9 @@ impl App {
             sync_status,
         ]))
         .block(Block::default().borders(Borders::ALL).title("Settings"));
-        f.render_widget(sync_info, chunks[1]);
+        if self.is_omarchy {
+            f.render_widget(sync_info, chunks[1]);
+        }
 
         let items: Vec<ListItem> = self
             .devices
@@ -583,21 +596,29 @@ impl App {
             .constraints([Constraint::Length(1), Constraint::Length(3)].as_ref())
             .split(chunks[3]);
 
-        let shortcuts = Paragraph::new(Line::from(vec![
+        let mut shortcut_spans = vec![
             Span::styled(" j/k: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("Move | "),
             Span::styled("c: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("Color | "),
-            Span::styled("s: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("Sync | "),
-            Span::styled("t: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("Force Sync | "),
+        ];
+        if self.is_omarchy {
+            shortcut_spans.extend([
+                Span::styled("s: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw("Sync | "),
+                Span::styled("t: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw("Force Sync | "),
+            ]);
+        }
+        shortcut_spans.extend([
             Span::styled("r: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("Rainbow | "),
+            Span::styled("o: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("Off | "),
             Span::styled("q: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("Quit"),
-        ]))
-        .alignment(Alignment::Center);
+        ]);
+        let shortcuts = Paragraph::new(Line::from(shortcut_spans)).alignment(Alignment::Center);
         f.render_widget(shortcuts, bottom_chunks[0]);
 
         let msg = self.status_msg.lock().unwrap().clone();
