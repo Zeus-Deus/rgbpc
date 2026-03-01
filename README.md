@@ -11,12 +11,6 @@ A sleek Terminal User Interface (TUI) application designed to sync your PC's RGB
 
 ## Installation
 
-### Prerequisites
-Ensure you have `openrgb` installed, configured, and running.
-```bash
-sudo pacman -S openrgb
-```
-
 ### From AUR (Recommended)
 You can easily install `rgbpc` from the Arch User Repository using your favorite helper:
 ```bash
@@ -37,14 +31,9 @@ sudo cp assets/rgbpc.desktop /usr/share/applications/
 - Upon a theme change, it executes `rgbpc --sync-theme` silently in the background.
 - It parses your devices, ignores the blacklisted ones, and pushes the exact hexadecimal color to the active components.
 
-## Support
-Designed for Arch Linux and the Omarchy desktop environment.
-
 ## Omarchy / Hyprland Window Rules
-Since `rgbpc` is a terminal app, it will normally tile like a regular terminal window. If you want it to open as a floating, centered app (like a GUI settings manager) when launched from Walker, add the following to your `~/.config/hypr/hyprland.conf` or Omarchy's window rules config:
+Since `rgbpc` is a TUI app, we've configured its desktop file to use `org.omarchy.RGBPC` as its window class. If you want it to open as a floating, centered app (like a GUI settings manager) when launched from Walker, simply add the following to your `~/.config/hypr/windows.conf` (or wherever you keep window rules):
 
 ```conf
-windowrulev2 = float, title:^(RGBPC)$
-windowrulev2 = center, title:^(RGBPC)$
-windowrulev2 = size 800 600, title:^(RGBPC)$
+windowrule = float on, center on, size 800 600, match:initial_class org.omarchy.RGBPC
 ```
