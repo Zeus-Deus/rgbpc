@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=RGB Sync
+Comment=Manage OpenRGB and sync hardware with Omarchy themes
+Exec=rgbpc
+Icon=preferences-desktop-theme
+Terminal=false
+Type=Application
+Categories=Utility;Settings;HardwareSettings;
+Keywords=rgb;openrgb;omarchy;theme;sync;
