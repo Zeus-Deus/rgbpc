@@ -4,16 +4,21 @@ use crate::core::{
     openrgb::{self, OpenRgbDevice},
 };
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, size as term_size, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use ratatui::{
     backend::{Backend, CrosstermBackend},
-    layout::{Alignment, Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph},
     Terminal,
 };
 use std::fs;
@@ -25,8 +30,21 @@ use std::time::Duration;
 
 pub enum AppEvent {
     SyncComplete(Result<(), String>),
+    ColorSetComplete(Result<(), String>),
     Tick,
 }
+
+#[derive(PartialEq)]
+pub enum AppMode {
+    Normal,
+    ColorPicker,
+}
+
+const PALETTE: &[&str] = &[
+    "FF0000", "00FF00", "0000FF", "FFFF00", "00FFFF", "FF00FF", "FFFFFF", "000000", "FFA500",
+    "800080", "008000", "FFC0CB", "808080", "A52A2A", "FFD700", "4B0082", "F08080", "E6E6FA",
+    "FF7F50", "008080", "000080", "00008B", "40E0D0", "8B0000",
+];
 
 pub struct App {
     config: AppConfig,
@@ -35,6 +53,10 @@ pub struct App {
     status_msg: Arc<Mutex<String>>,
     theme_color: String,
     is_syncing: bool,
+    mode: AppMode,
+    selected_color_index: usize,
+    custom_hex_input: String,
+    input_active: bool,
 }
 
 impl App {
@@ -67,9 +89,13 @@ impl App {
             config,
             devices,
             selected_index: 0,
-            status_msg: Arc::new(Mutex::new("Press 's' to toggle Sync, 'Enter'/'Space' to toggle Device, 't' to force sync, 'r' for rainbow, 'q' to quit.".to_string())),
+            status_msg: Arc::new(Mutex::new("Press 's' toggle Sync, 'Enter'/'Space' toggle Device, 'c' manual Color, 't' Force sync, 'r' rainbow, 'q' quit.".to_string())),
             theme_color: hex_color,
             is_syncing: false,
+            mode: AppMode::Normal,
+            selected_color_index: 0,
+            custom_hex_input: String::new(),
+            input_active: false,
         }
     }
 
@@ -112,36 +138,93 @@ impl App {
         loop {
             terminal.draw(|f| self.ui(f))?;
 
-            // Non-blocking event check to allow MPSC messages to process
             if event::poll(Duration::from_millis(50))? {
-                if let Event::Key(key) = event::read()? {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                        KeyCode::Down | KeyCode::Char('j') => self.next(),
-                        KeyCode::Up | KeyCode::Char('k') => self.previous(),
-                        KeyCode::Enter | KeyCode::Char(' ') => self.toggle_current(),
-                        KeyCode::Char('s') => self.toggle_sync(),
-                        KeyCode::Char('t') => {
-                            if !self.is_syncing {
-                                self.is_syncing = true;
-                                *self.status_msg.lock().unwrap() =
-                                    "Syncing devices... please wait.".to_string();
-
-                                let tx_clone = tx.clone();
-                                thread::spawn(move || {
-                                    let res = crate::core::perform_sync(true);
-                                    let _ = tx_clone.send(AppEvent::SyncComplete(res));
-                                });
+                match event::read()? {
+                    Event::Key(key) => {
+                        if self.mode == AppMode::Normal {
+                            match key.code {
+                                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                                KeyCode::Down | KeyCode::Char('j') => self.next(),
+                                KeyCode::Up | KeyCode::Char('k') => self.previous(),
+                                KeyCode::Enter | KeyCode::Char(' ') => self.toggle_current(),
+                                KeyCode::Char('s') => self.toggle_sync(),
+                                KeyCode::Char('c') => self.open_color_picker(),
+                                KeyCode::Char('t') => self.force_sync(&tx),
+                                KeyCode::Char('o') => self.force_off(),
+                                KeyCode::Char('r') => self.force_rainbow(),
+                                _ => {}
+                            }
+                        } else if self.mode == AppMode::ColorPicker {
+                            if self.input_active {
+                                match key.code {
+                                    KeyCode::Esc => self.input_active = false,
+                                    KeyCode::Enter => self.apply_custom_color(&tx),
+                                    KeyCode::Backspace => {
+                                        self.custom_hex_input.pop();
+                                    }
+                                    KeyCode::Char(c) => {
+                                        if c.is_ascii_hexdigit() && self.custom_hex_input.len() < 6
+                                        {
+                                            self.custom_hex_input.push(c);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                match key.code {
+                                    KeyCode::Esc | KeyCode::Char('q') => {
+                                        self.mode = AppMode::Normal;
+                                        *self.status_msg.lock().unwrap() =
+                                            "Color picker cancelled.".to_string();
+                                    }
+                                    KeyCode::Left | KeyCode::Char('h') => {
+                                        if self.selected_color_index % 6 > 0 {
+                                            self.selected_color_index -= 1;
+                                        }
+                                    }
+                                    KeyCode::Right | KeyCode::Char('l') => {
+                                        if self.selected_color_index % 6 < 5 {
+                                            self.selected_color_index += 1;
+                                        }
+                                    }
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        if self.selected_color_index >= 6 {
+                                            self.selected_color_index -= 6;
+                                        }
+                                    }
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        if self.selected_color_index + 6 < PALETTE.len() {
+                                            self.selected_color_index += 6;
+                                        }
+                                    }
+                                    KeyCode::Enter | KeyCode::Char(' ') => {
+                                        self.apply_palette_color(&tx);
+                                    }
+                                    KeyCode::Char('i') => {
+                                        self.input_active = true;
+                                        self.custom_hex_input.clear();
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
-                        KeyCode::Char('o') => self.force_off(),
-                        KeyCode::Char('r') => self.force_rainbow(),
-                        _ => {}
                     }
+                    Event::Mouse(mouse) => {
+                        if self.mode == AppMode::ColorPicker {
+                            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                                self.handle_mouse_click(
+                                    mouse.column,
+                                    mouse.row,
+                                    terminal.size().unwrap_or_default(),
+                                    &tx,
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
 
-            // Process async events
             while let Ok(app_event) = rx.try_recv() {
                 match app_event {
                     AppEvent::SyncComplete(res) => {
@@ -155,9 +238,167 @@ impl App {
                             }
                         }
                     }
-                    AppEvent::Tick => {} // Just to wake up and redraw
+                    AppEvent::ColorSetComplete(res) => match res {
+                        Ok(_) => {
+                            *self.status_msg.lock().unwrap() =
+                                "Color applied successfully!".to_string()
+                        }
+                        Err(e) => {
+                            *self.status_msg.lock().unwrap() =
+                                format!("Failed to apply color: {}", e)
+                        }
+                    },
+                    AppEvent::Tick => {}
                 }
             }
+        }
+    }
+
+    fn open_color_picker(&mut self) {
+        if self.devices.is_empty() {
+            *self.status_msg.lock().unwrap() = "No devices to apply color to.".to_string();
+            return;
+        }
+        self.mode = AppMode::ColorPicker;
+        self.selected_color_index = 0;
+        self.custom_hex_input.clear();
+        self.input_active = false;
+        *self.status_msg.lock().unwrap() =
+            "Pick a color or press 'i' to type HEX. Esc to cancel.".to_string();
+    }
+
+    fn force_sync(&mut self, tx: &mpsc::Sender<AppEvent>) {
+        if !self.is_syncing {
+            self.is_syncing = true;
+            *self.status_msg.lock().unwrap() = "Syncing devices... please wait.".to_string();
+
+            let tx_clone = tx.clone();
+            thread::spawn(move || {
+                let res = crate::core::perform_sync(true);
+                let _ = tx_clone.send(AppEvent::SyncComplete(res));
+            });
+        }
+    }
+
+    fn apply_palette_color(&mut self, tx: &mpsc::Sender<AppEvent>) {
+        if self.devices.is_empty() {
+            return;
+        }
+        let color = PALETTE[self.selected_color_index].to_string();
+        let dev_id = self.devices[self.selected_index].id;
+
+        *self.status_msg.lock().unwrap() = format!("Applying color #{}...", color);
+        let tx_clone = tx.clone();
+        thread::spawn(move || {
+            let res = crate::core::openrgb::set_color(dev_id, &color)
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            let _ = tx_clone.send(AppEvent::ColorSetComplete(res));
+        });
+        self.mode = AppMode::Normal;
+    }
+
+    fn apply_custom_color(&mut self, tx: &mpsc::Sender<AppEvent>) {
+        if self.devices.is_empty() {
+            return;
+        }
+        if self.custom_hex_input.len() == 6 {
+            let color = self.custom_hex_input.clone();
+            let dev_id = self.devices[self.selected_index].id;
+
+            *self.status_msg.lock().unwrap() = format!("Applying custom color #{}...", color);
+            let tx_clone = tx.clone();
+            thread::spawn(move || {
+                let res = crate::core::openrgb::set_color(dev_id, &color)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+                let _ = tx_clone.send(AppEvent::ColorSetComplete(res));
+            });
+            self.mode = AppMode::Normal;
+        } else {
+            *self.status_msg.lock().unwrap() = "HEX code must be 6 characters!".to_string();
+        }
+    }
+
+    fn popup_area(area: Rect, width: u16, height: u16) -> Rect {
+        let popup_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length((area.height.saturating_sub(height)) / 2),
+                Constraint::Length(height),
+                Constraint::Min(0),
+            ])
+            .split(area);
+
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length((area.width.saturating_sub(width)) / 2),
+                Constraint::Length(width),
+                Constraint::Min(0),
+            ])
+            .split(popup_layout[1])[1]
+    }
+
+    fn get_palette_rects(area: Rect) -> Vec<Rect> {
+        let mut rects = Vec::new();
+        let col_width = area.width / 6;
+        let row_height = area.height / 4;
+
+        for row in 0..4 {
+            for col in 0..6 {
+                rects.push(Rect {
+                    x: area.x + col * col_width,
+                    y: area.y + row * row_height,
+                    width: col_width,
+                    height: row_height,
+                });
+            }
+        }
+        rects
+    }
+
+    fn handle_mouse_click(
+        &mut self,
+        col: u16,
+        row: u16,
+        term_area: Rect,
+        tx: &mpsc::Sender<AppEvent>,
+    ) {
+        let popup = Self::popup_area(term_area, 44, 22);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(12),
+                Constraint::Length(3),
+            ])
+            .split(popup);
+
+        let palette_rects = Self::get_palette_rects(chunks[1]);
+
+        for (i, rect) in palette_rects.iter().enumerate() {
+            if col >= rect.x
+                && col < rect.x + rect.width
+                && row >= rect.y
+                && row < rect.y + rect.height
+            {
+                self.selected_color_index = i;
+                self.input_active = false;
+                self.apply_palette_color(tx);
+                return;
+            }
+        }
+
+        let input_rect = chunks[2];
+        if col >= input_rect.x
+            && col < input_rect.x + input_rect.width
+            && row >= input_rect.y
+            && row < input_rect.y + input_rect.height
+        {
+            self.input_active = true;
+            self.custom_hex_input.clear();
         }
     }
 
@@ -328,7 +569,7 @@ impl App {
         let list = List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Hardware Devices (Space/Enter to toggle)"),
+                .title("Hardware Devices (Space/Enter toggle | 'c' Manual Color)"),
         );
         f.render_widget(list, chunks[2]);
 
@@ -340,19 +581,14 @@ impl App {
         let shortcuts = Paragraph::new(Line::from(vec![
             Span::styled(" j/k: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("Move | "),
-            Span::styled(
-                "Space/Enter: ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("Toggle | "),
+            Span::styled("c: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("Color | "),
             Span::styled("s: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("Sync Hook | "),
+            Span::raw("Sync | "),
             Span::styled("t: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("Force Sync | "),
             Span::styled("r: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("Rainbow | "),
-            Span::styled("o: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("Lights Off | "),
             Span::styled("q: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("Quit"),
         ]))
@@ -364,5 +600,77 @@ impl App {
             .block(Block::default().borders(Borders::ALL).title("Status"))
             .style(Style::default().fg(Color::Yellow));
         f.render_widget(footer, bottom_chunks[1]);
+
+        if self.mode == AppMode::ColorPicker {
+            let popup = Self::popup_area(f.size(), 44, 22);
+            f.render_widget(Clear, popup);
+
+            let block = Block::default()
+                .title(format!(
+                    " Pick Color for {} ",
+                    self.devices
+                        .get(self.selected_index)
+                        .map(|d| d.name.as_str())
+                        .unwrap_or("Device")
+                ))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Thick)
+                .style(Style::default().bg(Color::Black));
+            f.render_widget(block.clone(), popup);
+
+            let inner_area = block.inner(popup);
+            let pop_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([
+                    Constraint::Length(2),
+                    Constraint::Length(12),
+                    Constraint::Length(3),
+                ])
+                .split(inner_area);
+
+            let instruction = Paragraph::new("Use h/j/k/l or mouse to pick. Enter to apply.")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::Gray));
+            f.render_widget(instruction, pop_chunks[0]);
+
+            let palette_rects = Self::get_palette_rects(pop_chunks[1]);
+            for (i, &hex) in PALETTE.iter().enumerate() {
+                let mut color_block =
+                    Block::default().style(Style::default().bg(Self::hex_to_rgb(hex)));
+
+                if i == self.selected_color_index && !self.input_active {
+                    color_block = color_block
+                        .borders(Borders::ALL)
+                        .border_style(
+                            Style::default()
+                                .fg(Color::White)
+                                .bg(Color::Black)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .border_type(BorderType::Thick);
+                }
+
+                f.render_widget(color_block, palette_rects[i]);
+            }
+
+            let input_style = if self.input_active {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            let input_block = Block::default()
+                .title(" Custom HEX (Press 'i' to type) ")
+                .borders(Borders::ALL)
+                .border_style(input_style);
+
+            let input_text = Paragraph::new(format!("#{}", self.custom_hex_input))
+                .block(input_block)
+                .alignment(Alignment::Center);
+            f.render_widget(input_text, pop_chunks[2]);
+        }
     }
 }

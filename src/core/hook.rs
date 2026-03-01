@@ -27,14 +27,16 @@ pub fn install_hook() -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    
+
     fs::write(&path, HOOK_SCRIPT).map_err(|e| e.to_string())?;
-    
+
     // Make executable
-    let mut perms = fs::metadata(&path).map_err(|e| e.to_string())?.permissions();
+    let mut perms = fs::metadata(&path)
+        .map_err(|e| e.to_string())?
+        .permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&path, perms).map_err(|e| e.to_string())?;
-    
+
     Ok(())
 }
 
