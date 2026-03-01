@@ -10,7 +10,7 @@ use crossterm::{
     execute,
     terminal::{
         disable_raw_mode, enable_raw_mode, size as term_size, EnterAlternateScreen,
-        LeaveAlternateScreen,
+        LeaveAlternateScreen, SetTitle,
     },
 };
 use ratatui::{
@@ -102,7 +102,12 @@ impl App {
     pub fn run(&mut self) -> io::Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            SetTitle("RGBPC")
+        )?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
