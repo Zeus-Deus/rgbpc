@@ -1,6 +1,6 @@
 # RGBPC
 
-A sleek GTK4/Libadwaita application designed to sync your PC's RGB lighting (Motherboard, Mouse, Keyboard, etc.) seamlessly with Omarchy themes via OpenRGB.
+A sleek Terminal User Interface (TUI) application designed to sync your PC's RGB lighting (Motherboard, Mouse, Keyboard, etc.) seamlessly with Omarchy themes via OpenRGB.
 
 ## Features
 
@@ -14,7 +14,7 @@ A sleek GTK4/Libadwaita application designed to sync your PC's RGB lighting (Mot
 ### Prerequisites
 Ensure you have `openrgb` installed, configured, and running.
 ```bash
-sudo pacman -S openrgb gtk4 libadwaita
+sudo pacman -S openrgb
 ```
 
 ### Build from source
