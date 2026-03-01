@@ -1,6 +1,6 @@
 [Desktop Entry]
-Name=RGB Sync
-Comment=Manage OpenRGB and sync hardware with Omarchy themes
+Name=RGBPC
+Comment=Manage RGB lighting via OpenRGB
 Exec=xdg-terminal-exec --app-id=org.omarchy.RGBPC -e rgbpc
 Icon=preferences-desktop-theme
 Terminal=false
