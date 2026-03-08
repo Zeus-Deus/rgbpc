@@ -1,6 +1,8 @@
+![screenshot](screenshots/image.png)
+
 # RGBPC
 
-A terminal UI application for managing your PC's RGB lighting via OpenRGB. Control all your devices, apply colors, and keep your setup looking clean — right from the terminal.
+A TUI application for managing your PC's RGB lighting via OpenRGB. Control all your devices, apply colors, and keep your setup looking clean — right from the terminal.
 
 ## Features
 
@@ -8,16 +10,18 @@ A terminal UI application for managing your PC's RGB lighting via OpenRGB. Contr
 - **Manual Color Control:** Pick from a built-in palette or enter any custom HEX color, applied instantly to the selected device.
 - **Rainbow Mode:** One key to set all enabled devices to a rainbow/spectrum cycle effect.
 - **Fail-Safe Compatibility:** Tries multiple OpenRGB modes (`Direct`, `Static`, zone resizing) to maximize hardware compatibility.
-- **Omarchy Theme Sync** *(Omarchy users only)*: Automatically reads your `colors.toml` and syncs your current theme's accent color to all enabled devices. Includes a one-click hook installer for `~/.config/omarchy/hooks/theme-set`.
+- **Omarchy Theme Sync** _(Omarchy users only)_: Automatically reads your `colors.toml` and syncs your current theme's accent color to all enabled devices. Includes a one-click hook installer for `~/.config/omarchy/hooks/theme-set`.
 
 ## Installation
 
 ### From AUR (Recommended)
+
 ```bash
 yay -S rgbpc
 ```
 
 ### Build from source
+
 ```bash
 git clone https://github.com/Zeus-Deus/rgbpc.git
 cd rgbpc
