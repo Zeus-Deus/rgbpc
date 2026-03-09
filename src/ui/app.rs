@@ -9,8 +9,7 @@ use crossterm::{
     },
     execute,
     terminal::{
-        disable_raw_mode, enable_raw_mode, size as term_size, EnterAlternateScreen,
-        LeaveAlternateScreen, SetTitle,
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
     },
 };
 use ratatui::{
@@ -21,7 +20,6 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph},
     Terminal,
 };
-use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
@@ -29,8 +27,11 @@ use std::thread;
 use std::time::Duration;
 
 pub enum AppEvent {
+    DevicesReloaded(Result<Vec<OpenRgbDevice>, String>),
     SyncComplete(Result<(), String>),
     ColorSetComplete(Result<(), String>),
+    OffComplete(Result<(), String>),
+    RainbowComplete(Result<(), String>),
     Tick,
 }
 
@@ -69,35 +70,16 @@ impl App {
         omarchy_dir.push(".config/omarchy");
         let is_omarchy = omarchy_dir.is_dir();
 
-        let mut hex_color = String::from("7aa2f7");
-        let mut theme_path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
-        theme_path.push(".config/omarchy/current/theme/colors.toml");
-        if let Ok(content) = fs::read_to_string(&theme_path) {
-            for line in content.lines() {
-                if line.starts_with("rgb") || line.starts_with("accent") {
-                    let parts: Vec<&str> = line.split('=').collect();
-                    if parts.len() == 2 {
-                        hex_color = parts[1]
-                            .trim()
-                            .trim_matches('"')
-                            .trim_start_matches('#')
-                            .to_string();
-                        if line.starts_with("rgb") {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        let hex_color = crate::core::load_theme_color().unwrap_or_else(|_| String::from("7aa2f7"));
 
         Self {
             config,
             devices,
             selected_index: 0,
             status_msg: Arc::new(Mutex::new(if is_omarchy {
-                "Press 's' toggle Sync, 'Enter'/'Space' toggle Device, 'c' manual Color, 't' Force sync, 'r' rainbow, 'q' quit.".to_string()
+                "Press 's' toggle Sync, 'Enter'/'Space' toggle Device, 'c' set color for all enabled, 't' Force sync all enabled, 'R' rescan, 'r' rainbow, 'q' quit.".to_string()
             } else {
-                "Press 'Enter'/'Space' toggle Device, 'c' manual Color, 'r' rainbow, 'o' off, 'q' quit.".to_string()
+                "Press 'Enter'/'Space' toggle Device, 'c' set color for all enabled, 'R' rescan, 'r' rainbow, 'o' off, 'q' quit.".to_string()
             })),
             theme_color: hex_color,
             is_syncing: false,
@@ -165,8 +147,9 @@ impl App {
                                 KeyCode::Char('s') if self.is_omarchy => self.toggle_sync(),
                                 KeyCode::Char('c') => self.open_color_picker(),
                                 KeyCode::Char('t') if self.is_omarchy => self.force_sync(&tx),
-                                KeyCode::Char('o') => self.force_off(),
-                                KeyCode::Char('r') => self.force_rainbow(),
+                                KeyCode::Char('R') => self.reload_devices(&tx),
+                                KeyCode::Char('o') => self.force_off(&tx),
+                                KeyCode::Char('r') => self.force_rainbow(&tx),
                                 _ => {}
                             }
                         } else if self.mode == AppMode::ColorPicker {
@@ -242,10 +225,19 @@ impl App {
 
             while let Ok(app_event) = rx.try_recv() {
                 match app_event {
+                    AppEvent::DevicesReloaded(result) => match result {
+                        Ok(devices) => self.finish_reload_devices(devices),
+                        Err(e) => {
+                            *self.status_msg.lock().unwrap() =
+                                format!("Device rescan failed: {}", e)
+                        }
+                    },
                     AppEvent::SyncComplete(res) => {
                         self.is_syncing = false;
                         match res {
                             Ok(_) => {
+                                self.theme_color = crate::core::load_theme_color()
+                                    .unwrap_or_else(|_| self.theme_color.clone());
                                 *self.status_msg.lock().unwrap() = "Sync complete!".to_string()
                             }
                             Err(e) => {
@@ -253,14 +245,34 @@ impl App {
                             }
                         }
                     }
-                    AppEvent::ColorSetComplete(res) => match res {
-                        Ok(_) => {
+                    AppEvent::ColorSetComplete(result) => match result {
+                        Ok(()) => {
                             *self.status_msg.lock().unwrap() =
                                 "Color applied successfully!".to_string()
                         }
                         Err(e) => {
                             *self.status_msg.lock().unwrap() =
-                                format!("Failed to apply color: {}", e)
+                                format!("Failed to apply color: {}", e);
+                            self.mode = AppMode::Normal;
+                        }
+                    },
+                    AppEvent::OffComplete(result) => match result {
+                        Ok(()) => {
+                            *self.status_msg.lock().unwrap() = "Lights turned off!".to_string();
+                        }
+                        Err(e) => {
+                            *self.status_msg.lock().unwrap() =
+                                format!("Failed to turn off lights: {}", e);
+                        }
+                    },
+                    AppEvent::RainbowComplete(result) => match result {
+                        Ok(_) => {
+                            *self.status_msg.lock().unwrap() =
+                                "Rainbow mode command sent!".to_string();
+                        }
+                        Err(e) => {
+                            *self.status_msg.lock().unwrap() =
+                                format!("Failed to set rainbow mode: {}", e);
                         }
                     },
                     AppEvent::Tick => {}
@@ -274,12 +286,59 @@ impl App {
             *self.status_msg.lock().unwrap() = "No devices to apply color to.".to_string();
             return;
         }
+        if !self.has_enabled_devices() {
+            *self.status_msg.lock().unwrap() =
+                "All devices are disabled. Enable at least one device before manual color."
+                    .to_string();
+            return;
+        }
         self.mode = AppMode::ColorPicker;
         self.selected_color_index = 0;
         self.custom_hex_input.clear();
         self.input_active = false;
         *self.status_msg.lock().unwrap() =
-            "Pick a color or press 'i' to type HEX. Esc to cancel.".to_string();
+            "Pick a color for all enabled devices or press 'i' to type HEX. Esc to cancel."
+                .to_string();
+    }
+
+    fn reload_devices(&mut self, tx: &mpsc::Sender<AppEvent>) {
+        *self.status_msg.lock().unwrap() = "Rescanning OpenRGB devices...".to_string();
+        let tx_clone = tx.clone();
+        thread::spawn(move || {
+            let mut result = crate::core::openrgb::list_devices();
+            if let Ok(devices) = result.as_mut() {
+                let _ = crate::core::openrgb::refresh_device_ids(devices);
+            }
+            let _ = tx_clone.send(AppEvent::DevicesReloaded(result));
+        });
+    }
+
+    fn finish_reload_devices(&mut self, devices: Vec<OpenRgbDevice>) {
+        let previous_key = self
+            .devices
+            .get(self.selected_index)
+            .map(openrgb::device_profile_key);
+
+        self.devices = devices;
+
+        self.selected_index = previous_key
+            .and_then(|key| {
+                self.devices
+                    .iter()
+                    .position(|device| openrgb::device_profile_key(device) == key)
+            })
+            .unwrap_or(0);
+
+        if self.devices.is_empty() {
+            self.selected_index = 0;
+            *self.status_msg.lock().unwrap() =
+                "Device rescan complete, but no OpenRGB devices were found.".to_string();
+        } else {
+            *self.status_msg.lock().unwrap() = format!(
+                "Device rescan complete: {} device(s) found.",
+                self.devices.len()
+            );
+        }
     }
 
     fn force_sync(&mut self, tx: &mpsc::Sender<AppEvent>) {
@@ -300,14 +359,21 @@ impl App {
             return;
         }
         let color = PALETTE[self.selected_color_index].to_string();
-        let dev_id = self.devices[self.selected_index].id;
+        let mut devices = self.enabled_devices();
+        if devices.is_empty() {
+            *self.status_msg.lock().unwrap() =
+                "All devices are disabled. Enable at least one device before manual color."
+                    .to_string();
+            self.mode = AppMode::Normal;
+            return;
+        }
 
-        *self.status_msg.lock().unwrap() = format!("Applying color #{}...", color);
+        *self.status_msg.lock().unwrap() =
+            format!("Applying color #{} to all enabled devices...", color);
         let tx_clone = tx.clone();
         thread::spawn(move || {
-            let res = crate::core::openrgb::set_color(dev_id, &color)
-                .map(|_| ())
-                .map_err(|e| e.to_string());
+            let _ = openrgb::refresh_device_ids(&mut devices);
+            let res = apply_color_to_devices(devices, &color);
             let _ = tx_clone.send(AppEvent::ColorSetComplete(res));
         });
         self.mode = AppMode::Normal;
@@ -319,14 +385,21 @@ impl App {
         }
         if self.custom_hex_input.len() == 6 {
             let color = self.custom_hex_input.clone();
-            let dev_id = self.devices[self.selected_index].id;
+            let mut devices = self.enabled_devices();
+            if devices.is_empty() {
+                *self.status_msg.lock().unwrap() =
+                    "All devices are disabled. Enable at least one device before manual color."
+                        .to_string();
+                self.mode = AppMode::Normal;
+                return;
+            }
 
-            *self.status_msg.lock().unwrap() = format!("Applying custom color #{}...", color);
+            *self.status_msg.lock().unwrap() =
+                format!("Applying custom color #{} to all enabled devices...", color);
             let tx_clone = tx.clone();
             thread::spawn(move || {
-                let res = crate::core::openrgb::set_color(dev_id, &color)
-                    .map(|_| ())
-                    .map_err(|e| e.to_string());
+                let _ = openrgb::refresh_device_ids(&mut devices);
+                let res = apply_color_to_devices(devices, &color);
                 let _ = tx_clone.send(AppEvent::ColorSetComplete(res));
             });
             self.mode = AppMode::Normal;
@@ -433,66 +506,97 @@ impl App {
         }
     }
 
+    fn has_enabled_devices(&self) -> bool {
+        self.devices.iter().any(|device| {
+            let dev_key = openrgb::device_profile_key(device);
+            !self.config.is_device_disabled(&dev_key, &device.name)
+        })
+    }
+
+    fn enabled_devices(&self) -> Vec<OpenRgbDevice> {
+        self.devices
+            .iter()
+            .filter(|device| {
+                let dev_key = openrgb::device_profile_key(device);
+                !self.config.is_device_disabled(&dev_key, &device.name)
+            })
+            .cloned()
+            .collect()
+    }
+
     fn toggle_current(&mut self) {
         if self.devices.is_empty() {
             return;
         }
-        let dev_name = self.devices[self.selected_index].name.clone();
-        if self.config.disabled_devices.contains(&dev_name) {
-            self.config.disabled_devices.remove(&dev_name);
-            *self.status_msg.lock().unwrap() = format!("Enabled {}", dev_name);
+        let device = self.devices[self.selected_index].clone();
+        let dev_key = openrgb::device_profile_key(&device);
+        if self.config.is_device_disabled(&dev_key, &device.name) {
+            self.config
+                .set_device_disabled(&dev_key, &device.name, false);
+            *self.status_msg.lock().unwrap() = format!("Enabled {}", device.name);
         } else {
-            self.config.disabled_devices.insert(dev_name.clone());
-            *self.status_msg.lock().unwrap() = format!("Disabled {}", dev_name);
+            self.config
+                .set_device_disabled(&dev_key, &device.name, true);
+            *self.status_msg.lock().unwrap() = format!("Disabled {}", device.name);
         }
         let _ = self.config.save();
     }
 
     fn toggle_sync(&mut self) {
-        self.config.omarchy_sync_enabled = !self.config.omarchy_sync_enabled;
-        let _ = self.config.save();
-        if self.config.omarchy_sync_enabled {
+        let enable_sync = !self.config.omarchy_sync_enabled;
+        if enable_sync {
             if let Err(e) = hook::install_hook() {
                 *self.status_msg.lock().unwrap() = format!("Error installing hook: {}", e);
-                self.config.omarchy_sync_enabled = false;
             } else {
+                self.config.omarchy_sync_enabled = true;
+                let _ = self.config.save();
                 *self.status_msg.lock().unwrap() = "Omarchy Sync Hook Installed!".to_string();
             }
         } else {
             if let Err(e) = hook::remove_hook() {
                 *self.status_msg.lock().unwrap() = format!("Error removing hook: {}", e);
             } else {
+                self.config.omarchy_sync_enabled = false;
+                let _ = self.config.save();
                 *self.status_msg.lock().unwrap() = "Omarchy Sync Hook Removed!".to_string();
             }
         }
     }
 
-    fn force_rainbow(&mut self) {
+    fn force_rainbow(&mut self, tx: &mpsc::Sender<AppEvent>) {
         *self.status_msg.lock().unwrap() = "Setting Rainbow mode...".to_string();
-        for dev in &self.devices {
-            if !self.config.disabled_devices.contains(&dev.name) {
-                let _ = std::process::Command::new("openrgb")
-                    .args(&["-d", &dev.id.to_string(), "-m", "Rainbow wave"])
-                    .output();
-                let _ = std::process::Command::new("openrgb")
-                    .args(&["-d", &dev.id.to_string(), "-m", "Spectrum Cycle"])
-                    .output();
-                let _ = std::process::Command::new("openrgb")
-                    .args(&["-d", &dev.id.to_string(), "-m", "Rainbow Circle"])
-                    .output();
-            }
+        let mut devices = self.enabled_devices();
+        if devices.is_empty() {
+            *self.status_msg.lock().unwrap() =
+                "All devices are disabled. Enable at least one device first.".to_string();
+            return;
         }
-        *self.status_msg.lock().unwrap() = "Rainbow mode command sent!".to_string();
+
+        thread::spawn({
+            let tx = tx.clone();
+            move || {
+                let _ = openrgb::refresh_device_ids(&mut devices);
+                let result = set_rainbow_for_devices(devices);
+                let _ = tx.send(AppEvent::RainbowComplete(result));
+            }
+        });
     }
 
-    fn force_off(&mut self) {
+    fn force_off(&mut self, tx: &mpsc::Sender<AppEvent>) {
         *self.status_msg.lock().unwrap() = "Turning off lights...".to_string();
-        for dev in &self.devices {
-            if !self.config.disabled_devices.contains(&dev.name) {
-                let _ = crate::core::openrgb::set_color(dev.id, "000000");
-            }
+        let mut devices = self.enabled_devices();
+        if devices.is_empty() {
+            *self.status_msg.lock().unwrap() =
+                "All devices are disabled. Enable at least one device first.".to_string();
+            return;
         }
-        *self.status_msg.lock().unwrap() = "Lights turned off!".to_string();
+
+        let tx_clone = tx.clone();
+        thread::spawn(move || {
+            let _ = openrgb::refresh_device_ids(&mut devices);
+            let result = apply_color_to_devices(devices, "000000");
+            let _ = tx_clone.send(AppEvent::OffComplete(result));
+        });
     }
 
     fn hex_to_rgb(hex: &str) -> Color {
@@ -566,7 +670,8 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, dev)| {
-                let is_enabled = !self.config.disabled_devices.contains(&dev.name);
+                let dev_key = openrgb::device_profile_key(dev);
+                let is_enabled = !self.config.is_device_disabled(&dev_key, &dev.name);
                 let checkbox = if is_enabled { "[X]" } else { "[ ]" };
 
                 let mut style = Style::default();
@@ -584,11 +689,10 @@ impl App {
             })
             .collect();
 
-        let list = List::new(items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Hardware Devices (Space/Enter toggle | 'c' Manual Color)"),
-        );
+        let list =
+            List::new(items).block(Block::default().borders(Borders::ALL).title(
+                "Hardware Devices (Space/Enter toggle | 'c' Color all enabled | 'R' Rescan)",
+            ));
         f.render_widget(list, chunks[2]);
 
         let bottom_chunks = Layout::default()
@@ -600,7 +704,9 @@ impl App {
             Span::styled(" j/k: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("Move | "),
             Span::styled("c: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("Color | "),
+            Span::raw("All Enabled Color | "),
+            Span::styled("R: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("Rescan | "),
         ];
         if self.is_omarchy {
             shortcut_spans.extend([
@@ -632,13 +738,7 @@ impl App {
             f.render_widget(Clear, popup);
 
             let block = Block::default()
-                .title(format!(
-                    " Pick Color for {} ",
-                    self.devices
-                        .get(self.selected_index)
-                        .map(|d| d.name.as_str())
-                        .unwrap_or("Device")
-                ))
+                .title(" Pick Color for Enabled Devices ")
                 .borders(Borders::ALL)
                 .border_type(BorderType::Thick)
                 .style(Style::default().bg(Color::Black));
@@ -655,9 +755,11 @@ impl App {
                 ])
                 .split(inner_area);
 
-            let instruction = Paragraph::new("Use h/j/k/l or mouse to pick. Enter to apply.")
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::Gray));
+            let instruction = Paragraph::new(
+                "Use h/j/k/l or mouse to pick. Enter applies to all enabled devices.",
+            )
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Gray));
             f.render_widget(instruction, pop_chunks[0]);
 
             let palette_rects = Self::get_palette_rects(pop_chunks[1]);
@@ -698,5 +800,75 @@ impl App {
                 .alignment(Alignment::Center);
             f.render_widget(input_text, pop_chunks[2]);
         }
+    }
+}
+
+fn apply_color_to_devices(devices: Vec<OpenRgbDevice>, color: &str) -> Result<(), String> {
+    let mut failures = Vec::new();
+
+    for device in devices {
+        match crate::core::openrgb::apply_color(&device, color) {
+            Ok(_) => {}
+            Err(err) => failures.push(format!("{}: {}", device.name, err)),
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join(" | "))
+    }
+}
+
+fn set_rainbow_for_devices(devices: Vec<OpenRgbDevice>) -> Result<(), String> {
+    let mut failures = Vec::new();
+
+    for device in devices {
+        let id = device.id.to_string();
+        let mut succeeded = false;
+        let mut device_errors = Vec::new();
+
+        for mode in ["Rainbow wave", "Spectrum Cycle", "Rainbow Circle"] {
+            match std::process::Command::new("openrgb")
+                .args(["-d", id.as_str(), "-m", mode])
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    succeeded = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) => device_errors.push(format!("{}: {}", device.name, err)),
+            }
+        }
+
+        if !succeeded {
+            if device_errors.is_empty() {
+                failures.push(format!("{}: no rainbow mode succeeded", device.name));
+            } else {
+                failures.extend(device_errors);
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join(" | "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_color_to_devices, set_rainbow_for_devices};
+
+    #[test]
+    fn apply_color_to_devices_succeeds_for_empty_list() {
+        assert_eq!(apply_color_to_devices(Vec::new(), "ffffff"), Ok(()));
+    }
+
+    #[test]
+    fn set_rainbow_for_devices_succeeds_for_empty_list() {
+        assert_eq!(set_rainbow_for_devices(Vec::new()), Ok(()));
     }
 }
