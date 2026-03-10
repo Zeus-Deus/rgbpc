@@ -1,7 +1,8 @@
 use crate::core::{
-    config::AppConfig,
+    config::{AppConfig, SavedState},
     hook,
     openrgb::{self, OpenRgbDevice},
+    DeviceActionSummary,
 };
 use crossterm::{
     event::{
@@ -29,9 +30,9 @@ use std::time::Duration;
 pub enum AppEvent {
     DevicesReloaded(Result<Vec<OpenRgbDevice>, String>),
     SyncComplete(Result<(), String>),
-    ColorSetComplete(Result<(), String>),
-    OffComplete(Result<(), String>),
-    RainbowComplete(Result<(), String>),
+    ColorSetComplete(DeviceActionSummary),
+    OffComplete(DeviceActionSummary),
+    RainbowComplete(DeviceActionSummary),
     Tick,
 }
 
@@ -59,6 +60,21 @@ pub struct App {
     custom_hex_input: String,
     input_active: bool,
     is_omarchy: bool,
+    pending_state_update: Option<PendingStateUpdate>,
+}
+
+#[derive(Clone)]
+struct PendingStateUpdate {
+    device_keys: Vec<String>,
+    state: SavedState,
+}
+
+fn filter_device_keys(requested: &[String], succeeded: &[String]) -> Vec<String> {
+    requested
+        .iter()
+        .filter(|key| succeeded.contains(key))
+        .cloned()
+        .collect()
 }
 
 impl App {
@@ -77,9 +93,9 @@ impl App {
             devices,
             selected_index: 0,
             status_msg: Arc::new(Mutex::new(if is_omarchy {
-                "Press 's' toggle Sync, 'Enter'/'Space' toggle Device, 'c' set color for all enabled, 't' Force sync all enabled, 'R' rescan, 'r' rainbow, 'q' quit.".to_string()
+                "Press 'a' toggle startup restore for the whole remembered setup, 's' toggle Sync, 'Enter'/'Space' toggle Device, 'c' set color for all enabled, 't' Force sync all enabled, 'R' rescan, 'r' rainbow, 'o' off, 'q' quit.".to_string()
             } else {
-                "Press 'Enter'/'Space' toggle Device, 'c' set color for all enabled, 'R' rescan, 'r' rainbow, 'o' off, 'q' quit.".to_string()
+                "Press 'a' toggle startup restore for the whole remembered setup, 'Enter'/'Space' toggle Device, 'c' set color for all enabled, 'R' rescan, 'r' rainbow, 'o' off, 'q' quit.".to_string()
             })),
             theme_color: hex_color,
             is_syncing: false,
@@ -88,6 +104,7 @@ impl App {
             custom_hex_input: String::new(),
             input_active: false,
             is_omarchy,
+            pending_state_update: None,
         }
     }
 
@@ -144,6 +161,7 @@ impl App {
                                 KeyCode::Down | KeyCode::Char('j') => self.next(),
                                 KeyCode::Up | KeyCode::Char('k') => self.previous(),
                                 KeyCode::Enter | KeyCode::Char(' ') => self.toggle_current(),
+                                KeyCode::Char('a') => self.toggle_restore_on_startup(),
                                 KeyCode::Char('s') if self.is_omarchy => self.toggle_sync(),
                                 KeyCode::Char('c') => self.open_color_picker(),
                                 KeyCode::Char('t') if self.is_omarchy => self.force_sync(&tx),
@@ -246,33 +264,97 @@ impl App {
                         }
                     }
                     AppEvent::ColorSetComplete(result) => match result {
-                        Ok(()) => {
-                            *self.status_msg.lock().unwrap() =
+                        summary if summary.is_any_success() => {
+                            if let Some(update) = self.pending_state_update.take() {
+                                self.config.set_saved_state_for_devices(
+                                    &filter_device_keys(
+                                        &update.device_keys,
+                                        &summary.succeeded_keys,
+                                    ),
+                                    update.state,
+                                );
+                                let _ = self.config.save();
+                            }
+                            *self.status_msg.lock().unwrap() = if summary.failed_devices.is_empty()
+                            {
                                 "Color applied successfully!".to_string()
+                            } else {
+                                format!(
+                                    "Color applied to {} device(s); some failed: {}",
+                                    summary.succeeded_keys.len(),
+                                    summary.failed_devices.join(" | ")
+                                )
+                            }
                         }
-                        Err(e) => {
-                            *self.status_msg.lock().unwrap() =
-                                format!("Failed to apply color: {}", e);
+                        summary => {
+                            self.pending_state_update = None;
+                            *self.status_msg.lock().unwrap() = format!(
+                                "Failed to apply color: {}",
+                                summary.failed_devices.join(" | ")
+                            );
                             self.mode = AppMode::Normal;
                         }
                     },
                     AppEvent::OffComplete(result) => match result {
-                        Ok(()) => {
-                            *self.status_msg.lock().unwrap() = "Lights turned off!".to_string();
+                        summary if summary.is_any_success() => {
+                            if let Some(update) = self.pending_state_update.take() {
+                                self.config.set_saved_state_for_devices(
+                                    &filter_device_keys(
+                                        &update.device_keys,
+                                        &summary.succeeded_keys,
+                                    ),
+                                    update.state,
+                                );
+                                let _ = self.config.save();
+                            }
+                            *self.status_msg.lock().unwrap() = if summary.failed_devices.is_empty()
+                            {
+                                "Lights turned off!".to_string()
+                            } else {
+                                format!(
+                                    "Lights turned off on {} device(s); some failed: {}",
+                                    summary.succeeded_keys.len(),
+                                    summary.failed_devices.join(" | ")
+                                )
+                            };
                         }
-                        Err(e) => {
-                            *self.status_msg.lock().unwrap() =
-                                format!("Failed to turn off lights: {}", e);
+                        summary => {
+                            self.pending_state_update = None;
+                            *self.status_msg.lock().unwrap() = format!(
+                                "Failed to turn off lights: {}",
+                                summary.failed_devices.join(" | ")
+                            );
                         }
                     },
                     AppEvent::RainbowComplete(result) => match result {
-                        Ok(_) => {
-                            *self.status_msg.lock().unwrap() =
-                                "Rainbow mode command sent!".to_string();
+                        summary if summary.is_any_success() => {
+                            if let Some(update) = self.pending_state_update.take() {
+                                self.config.set_saved_state_for_devices(
+                                    &filter_device_keys(
+                                        &update.device_keys,
+                                        &summary.succeeded_keys,
+                                    ),
+                                    update.state,
+                                );
+                                let _ = self.config.save();
+                            }
+                            *self.status_msg.lock().unwrap() = if summary.failed_devices.is_empty()
+                            {
+                                "Rainbow mode command sent!".to_string()
+                            } else {
+                                format!(
+                                    "Rainbow set on {} device(s); some failed: {}",
+                                    summary.succeeded_keys.len(),
+                                    summary.failed_devices.join(" | ")
+                                )
+                            };
                         }
-                        Err(e) => {
-                            *self.status_msg.lock().unwrap() =
-                                format!("Failed to set rainbow mode: {}", e);
+                        summary => {
+                            self.pending_state_update = None;
+                            *self.status_msg.lock().unwrap() = format!(
+                                "Failed to set rainbow mode: {}",
+                                summary.failed_devices.join(" | ")
+                            );
                         }
                     },
                     AppEvent::Tick => {}
@@ -370,10 +452,14 @@ impl App {
 
         *self.status_msg.lock().unwrap() =
             format!("Applying color #{} to all enabled devices...", color);
+        self.pending_state_update = Some(PendingStateUpdate {
+            device_keys: self.enabled_device_keys(),
+            state: SavedState::Color { hex: color.clone() },
+        });
         let tx_clone = tx.clone();
         thread::spawn(move || {
             let _ = openrgb::refresh_device_ids(&mut devices);
-            let res = apply_color_to_devices(devices, &color);
+            let res = crate::core::apply_color_to_devices_summary(devices, &color, true);
             let _ = tx_clone.send(AppEvent::ColorSetComplete(res));
         });
         self.mode = AppMode::Normal;
@@ -396,10 +482,14 @@ impl App {
 
             *self.status_msg.lock().unwrap() =
                 format!("Applying custom color #{} to all enabled devices...", color);
+            self.pending_state_update = Some(PendingStateUpdate {
+                device_keys: self.enabled_device_keys(),
+                state: SavedState::Color { hex: color.clone() },
+            });
             let tx_clone = tx.clone();
             thread::spawn(move || {
                 let _ = openrgb::refresh_device_ids(&mut devices);
-                let res = apply_color_to_devices(devices, &color);
+                let res = crate::core::apply_color_to_devices_summary(devices, &color, true);
                 let _ = tx_clone.send(AppEvent::ColorSetComplete(res));
             });
             self.mode = AppMode::Normal;
@@ -524,6 +614,13 @@ impl App {
             .collect()
     }
 
+    fn enabled_device_keys(&self) -> Vec<String> {
+        self.enabled_devices()
+            .iter()
+            .map(openrgb::device_profile_key)
+            .collect()
+    }
+
     fn toggle_current(&mut self) {
         if self.devices.is_empty() {
             return;
@@ -563,6 +660,26 @@ impl App {
         }
     }
 
+    fn toggle_restore_on_startup(&mut self) {
+        let enable_restore = !self.config.restore_on_startup;
+        if enable_restore {
+            if let Err(e) = hook::install_restore_autostart() {
+                *self.status_msg.lock().unwrap() = format!("Error installing autostart: {}", e);
+            } else {
+                self.config.restore_on_startup = true;
+                let _ = self.config.save();
+                *self.status_msg.lock().unwrap() =
+                    "Startup restore enabled via XDG autostart.".to_string();
+            }
+        } else if let Err(e) = hook::remove_restore_autostart() {
+            *self.status_msg.lock().unwrap() = format!("Error removing autostart: {}", e);
+        } else {
+            self.config.restore_on_startup = false;
+            let _ = self.config.save();
+            *self.status_msg.lock().unwrap() = "Startup restore disabled.".to_string();
+        }
+    }
+
     fn force_rainbow(&mut self, tx: &mpsc::Sender<AppEvent>) {
         *self.status_msg.lock().unwrap() = "Setting Rainbow mode...".to_string();
         let mut devices = self.enabled_devices();
@@ -576,9 +693,13 @@ impl App {
             let tx = tx.clone();
             move || {
                 let _ = openrgb::refresh_device_ids(&mut devices);
-                let result = set_rainbow_for_devices(devices);
+                let result = crate::core::set_rainbow_for_devices_summary(devices, true);
                 let _ = tx.send(AppEvent::RainbowComplete(result));
             }
+        });
+        self.pending_state_update = Some(PendingStateUpdate {
+            device_keys: self.enabled_device_keys(),
+            state: SavedState::Rainbow,
         });
     }
 
@@ -592,9 +713,13 @@ impl App {
         }
 
         let tx_clone = tx.clone();
+        self.pending_state_update = Some(PendingStateUpdate {
+            device_keys: self.enabled_device_keys(),
+            state: SavedState::Off,
+        });
         thread::spawn(move || {
             let _ = openrgb::refresh_device_ids(&mut devices);
-            let result = apply_color_to_devices(devices, "000000");
+            let result = crate::core::apply_color_to_devices_summary(devices, "000000", true);
             let _ = tx_clone.send(AppEvent::OffComplete(result));
         });
     }
@@ -612,7 +737,7 @@ impl App {
     }
 
     fn ui(&self, f: &mut ratatui::Frame) {
-        let settings_height = if self.is_omarchy { 4 } else { 0 };
+        let settings_height = if self.is_omarchy { 7 } else { 4 };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(2)
@@ -646,9 +771,9 @@ impl App {
         );
         f.render_widget(title, chunks[0]);
 
-        let sync_status = if self.config.omarchy_sync_enabled {
+        let restore_status = if self.config.restore_on_startup {
             Span::styled(
-                "ENABLED (Auto-Syncing with Omarchy)",
+                "ENABLED",
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
@@ -656,14 +781,45 @@ impl App {
         } else {
             Span::styled("DISABLED", Style::default().fg(Color::DarkGray))
         };
-        let sync_info = Paragraph::new(Line::from(vec![
-            Span::raw("Omarchy Theme Sync: "),
-            sync_status,
-        ]))
-        .block(Block::default().borders(Borders::ALL).title("Settings"));
+
+        let mut settings_lines = vec![Line::from(vec![
+            Span::raw("Startup Restore: "),
+            restore_status,
+            Span::raw(" (press 'a')"),
+        ])];
+        settings_lines.push(Line::from(
+            "Restores the whole remembered setup at login, not just devices currently checked.",
+        ));
+
         if self.is_omarchy {
-            f.render_widget(sync_info, chunks[1]);
+            let sync_status = if self.config.omarchy_sync_enabled {
+                Span::styled(
+                    "ENABLED",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled("DISABLED", Style::default().fg(Color::DarkGray))
+            };
+
+            settings_lines.push(Line::from(vec![
+                Span::raw("Omarchy Theme Sync: "),
+                sync_status,
+                Span::raw(" (press 's')"),
+            ]));
+            settings_lines.push(Line::from(
+                "Startup restore uses current Omarchy theme when sync is enabled.",
+            ));
+        } else {
+            settings_lines.push(Line::from(
+                "Startup restore reapplies the last successful manual color or off state.",
+            ));
         }
+
+        let settings = Paragraph::new(settings_lines)
+            .block(Block::default().borders(Borders::ALL).title("Settings"));
+        f.render_widget(settings, chunks[1]);
 
         let items: Vec<ListItem> = self
             .devices
@@ -691,8 +847,8 @@ impl App {
 
         let list =
             List::new(items).block(Block::default().borders(Borders::ALL).title(
-                "Hardware Devices (Space/Enter toggle | 'c' Color all enabled | 'R' Rescan)",
-            ));
+                 "Hardware Devices (Space/Enter toggle | 'a' Startup restore | 'c' Color all enabled | 'R' Rescan)",
+             ));
         f.render_widget(list, chunks[2]);
 
         let bottom_chunks = Layout::default()
@@ -703,6 +859,8 @@ impl App {
         let mut shortcut_spans = vec![
             Span::styled(" j/k: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("Move | "),
+            Span::styled("a: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("Startup Restore | "),
             Span::styled("c: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("All Enabled Color | "),
             Span::styled("R: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -803,72 +961,13 @@ impl App {
     }
 }
 
-fn apply_color_to_devices(devices: Vec<OpenRgbDevice>, color: &str) -> Result<(), String> {
-    let mut failures = Vec::new();
-
-    for device in devices {
-        match crate::core::openrgb::apply_color(&device, color) {
-            Ok(_) => {}
-            Err(err) => failures.push(format!("{}: {}", device.name, err)),
-        }
-    }
-
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(failures.join(" | "))
-    }
-}
-
-fn set_rainbow_for_devices(devices: Vec<OpenRgbDevice>) -> Result<(), String> {
-    let mut failures = Vec::new();
-
-    for device in devices {
-        let id = device.id.to_string();
-        let mut succeeded = false;
-        let mut device_errors = Vec::new();
-
-        for mode in ["Rainbow wave", "Spectrum Cycle", "Rainbow Circle"] {
-            match std::process::Command::new("openrgb")
-                .args(["-d", id.as_str(), "-m", mode])
-                .output()
-            {
-                Ok(output) if output.status.success() => {
-                    succeeded = true;
-                    break;
-                }
-                Ok(_) => {}
-                Err(err) => device_errors.push(format!("{}: {}", device.name, err)),
-            }
-        }
-
-        if !succeeded {
-            if device_errors.is_empty() {
-                failures.push(format!("{}: no rainbow mode succeeded", device.name));
-            } else {
-                failures.extend(device_errors);
-            }
-        }
-    }
-
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(failures.join(" | "))
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{apply_color_to_devices, set_rainbow_for_devices};
+    use crate::core::config::AppConfig;
 
     #[test]
-    fn apply_color_to_devices_succeeds_for_empty_list() {
-        assert_eq!(apply_color_to_devices(Vec::new(), "ffffff"), Ok(()));
-    }
-
-    #[test]
-    fn set_rainbow_for_devices_succeeds_for_empty_list() {
-        assert_eq!(set_rainbow_for_devices(Vec::new()), Ok(()));
+    fn startup_restore_toggle_defaults_off() {
+        let config = AppConfig::default();
+        assert!(!config.restore_on_startup);
     }
 }

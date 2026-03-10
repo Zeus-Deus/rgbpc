@@ -12,6 +12,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if args.len() > 1 && args[1] == "--restore-last" {
+        if let Err(e) = core::perform_restore() {
+            eprintln!("Restore failed: {}", e);
+        }
+        return Ok(());
+    }
+
     // Launch TUI
     let mut app = ui::app::App::new();
     app.run()?;

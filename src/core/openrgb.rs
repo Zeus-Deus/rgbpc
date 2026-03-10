@@ -1,6 +1,8 @@
 use regex::Regex;
 use std::process::Command;
 
+const RAINBOW_MODES: &[&str] = &["Rainbow wave", "Spectrum Cycle", "Rainbow Circle"];
+
 #[derive(Debug, Clone, Default)]
 pub struct OpenRgbDevice {
     pub id: u32,
@@ -118,6 +120,7 @@ fn strategy_attempts_for_device(device: &OpenRgbDevice) -> Vec<StrategyAttempt> 
         || device_type.contains("mainboard")
         || device_type.contains("ledstrip");
     let mouse_like = device_type.contains("mouse") || name.contains("mouse");
+    let keyboard_like = device_type.contains("keyboard") || name.contains("keyboard");
 
     if board_like {
         return vec![
@@ -165,6 +168,27 @@ fn strategy_attempts_for_device(device: &OpenRgbDevice) -> Vec<StrategyAttempt> 
         ];
     }
 
+    if keyboard_like {
+        return vec![
+            StrategyAttempt {
+                kind: StrategyKind::CustomThenColor,
+                needs_retry: false,
+            },
+            StrategyAttempt {
+                kind: StrategyKind::StaticThenColor,
+                needs_retry: false,
+            },
+            StrategyAttempt {
+                kind: StrategyKind::ColorOnly,
+                needs_retry: false,
+            },
+            StrategyAttempt {
+                kind: StrategyKind::FullFallback,
+                needs_retry: true,
+            },
+        ];
+    }
+
     vec![
         StrategyAttempt {
             kind: StrategyKind::ColorOnly,
@@ -194,6 +218,7 @@ struct StrategyAttempt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StrategyKind {
     ColorOnly,
+    CustomThenColor,
     DirectThenColor,
     StaticThenColor,
     ZoneResizeThenColor,
@@ -203,6 +228,7 @@ enum StrategyKind {
 fn apply_strategy(device_id: u32, color: &str, strategy: StrategyKind) -> Result<bool, String> {
     match strategy {
         StrategyKind::ColorOnly => apply_color_only(device_id, color),
+        StrategyKind::CustomThenColor => apply_custom_then_color(device_id, color),
         StrategyKind::DirectThenColor => apply_direct_then_color(device_id, color),
         StrategyKind::StaticThenColor => apply_static_then_color(device_id, color),
         StrategyKind::ZoneResizeThenColor => apply_zone_resize_then_color(device_id, color),
@@ -253,6 +279,11 @@ fn apply_direct_then_color(device_id: u32, color: &str) -> Result<bool, String> 
     let _ = set_direct_mode(device_id)?;
     let id = device_id.to_string();
     run_openrgb(&["-d", id.as_str(), "-c", color])
+}
+
+fn apply_custom_then_color(device_id: u32, color: &str) -> Result<bool, String> {
+    let id = device_id.to_string();
+    run_openrgb(&["-d", id.as_str(), "-m", "Custom", "-c", color])
 }
 
 fn set_direct_mode(device_id: u32) -> Result<bool, String> {
@@ -325,6 +356,28 @@ fn run_openrgb(args: &[&str]) -> Result<bool, String> {
     Ok(output.status.success())
 }
 
+pub fn set_rainbow(device: &OpenRgbDevice) -> Result<(), String> {
+    let id = device.id.to_string();
+    let mut last_error = None;
+
+    for mode in RAINBOW_MODES {
+        match Command::new("openrgb")
+            .args(["-d", id.as_str(), "-m", mode])
+            .output()
+        {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(_) => {}
+            Err(err) => remember_error(&mut last_error, format!("{}: {}", device.name, err)),
+        }
+    }
+
+    if let Some(err) = last_error {
+        Err(err)
+    } else {
+        Err(format!("{}: no rainbow mode succeeded", device.name))
+    }
+}
+
 fn record_attempt_result(
     result: Result<bool, String>,
     any_succeeded: &mut bool,
@@ -386,6 +439,18 @@ mod tests {
 
         let attempts = strategy_attempts_for_device(&device);
         assert_eq!(attempts[0].kind, StrategyKind::StaticThenColor);
+    }
+
+    #[test]
+    fn keyboard_devices_prefer_custom_mode_first() {
+        let device = OpenRgbDevice {
+            id: 1,
+            name: "EVision Keyboard 0C45:7698".to_string(),
+            device_type: "Keyboard".to_string(),
+        };
+
+        let attempts = strategy_attempts_for_device(&device);
+        assert_eq!(attempts[0].kind, StrategyKind::CustomThenColor);
     }
 
     #[test]
