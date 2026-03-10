@@ -108,7 +108,10 @@ pub fn apply_color(device: &OpenRgbDevice, color_hex: &str) -> Result<ApplyResul
         }
     }
 
-    finalize_attempts(false, last_error).map(|_| ApplyResult { needs_retry: false })
+    match finalize_attempts(false, last_error) {
+        Ok(_) => Err("All color application strategies failed silently".to_string()),
+        Err(err) => Err(err),
+    }
 }
 
 fn strategy_attempts_for_device(device: &OpenRgbDevice) -> Vec<StrategyAttempt> {

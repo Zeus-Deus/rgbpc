@@ -77,6 +77,10 @@ fn filter_device_keys(requested: &[String], succeeded: &[String]) -> Vec<String>
         .collect()
 }
 
+fn format_sync_scope(count: usize) -> String {
+    format!("{} device{}", count, if count == 1 { "" } else { "s" })
+}
+
 impl App {
     pub fn new() -> Self {
         let devices = openrgb::list_devices().unwrap_or_default();
@@ -266,13 +270,13 @@ impl App {
                     AppEvent::ColorSetComplete(result) => match result {
                         summary if summary.is_any_success() => {
                             if let Some(update) = self.pending_state_update.take() {
-                                self.config.set_saved_state_for_devices(
-                                    &filter_device_keys(
-                                        &update.device_keys,
-                                        &summary.succeeded_keys,
-                                    ),
-                                    update.state,
+                                let successful_keys = filter_device_keys(
+                                    &update.device_keys,
+                                    &summary.succeeded_keys,
                                 );
+                                self.config
+                                    .set_saved_state_for_devices(&successful_keys, update.state);
+                                self.config.remove_omarchy_sync_devices(&successful_keys);
                                 let _ = self.config.save();
                             }
                             *self.status_msg.lock().unwrap() = if summary.failed_devices.is_empty()
@@ -298,13 +302,13 @@ impl App {
                     AppEvent::OffComplete(result) => match result {
                         summary if summary.is_any_success() => {
                             if let Some(update) = self.pending_state_update.take() {
-                                self.config.set_saved_state_for_devices(
-                                    &filter_device_keys(
-                                        &update.device_keys,
-                                        &summary.succeeded_keys,
-                                    ),
-                                    update.state,
+                                let successful_keys = filter_device_keys(
+                                    &update.device_keys,
+                                    &summary.succeeded_keys,
                                 );
+                                self.config
+                                    .set_saved_state_for_devices(&successful_keys, update.state);
+                                self.config.remove_omarchy_sync_devices(&successful_keys);
                                 let _ = self.config.save();
                             }
                             *self.status_msg.lock().unwrap() = if summary.failed_devices.is_empty()
@@ -329,13 +333,13 @@ impl App {
                     AppEvent::RainbowComplete(result) => match result {
                         summary if summary.is_any_success() => {
                             if let Some(update) = self.pending_state_update.take() {
-                                self.config.set_saved_state_for_devices(
-                                    &filter_device_keys(
-                                        &update.device_keys,
-                                        &summary.succeeded_keys,
-                                    ),
-                                    update.state,
+                                let successful_keys = filter_device_keys(
+                                    &update.device_keys,
+                                    &summary.succeeded_keys,
                                 );
+                                self.config
+                                    .set_saved_state_for_devices(&successful_keys, update.state);
+                                self.config.remove_omarchy_sync_devices(&successful_keys);
                                 let _ = self.config.save();
                             }
                             *self.status_msg.lock().unwrap() = if summary.failed_devices.is_empty()
@@ -645,15 +649,21 @@ impl App {
             if let Err(e) = hook::install_hook() {
                 *self.status_msg.lock().unwrap() = format!("Error installing hook: {}", e);
             } else {
+                let sync_devices = self.enabled_device_keys();
                 self.config.omarchy_sync_enabled = true;
+                self.config.set_omarchy_sync_devices(&sync_devices);
                 let _ = self.config.save();
-                *self.status_msg.lock().unwrap() = "Omarchy Sync Hook Installed!".to_string();
+                *self.status_msg.lock().unwrap() = format!(
+                    "Omarchy Sync Hook Installed for {}!",
+                    format_sync_scope(sync_devices.len())
+                );
             }
         } else {
             if let Err(e) = hook::remove_hook() {
                 *self.status_msg.lock().unwrap() = format!("Error removing hook: {}", e);
             } else {
                 self.config.omarchy_sync_enabled = false;
+                self.config.omarchy_sync_devices.clear();
                 let _ = self.config.save();
                 *self.status_msg.lock().unwrap() = "Omarchy Sync Hook Removed!".to_string();
             }
@@ -689,6 +699,10 @@ impl App {
             return;
         }
 
+        self.pending_state_update = Some(PendingStateUpdate {
+            device_keys: self.enabled_device_keys(),
+            state: SavedState::Rainbow,
+        });
         thread::spawn({
             let tx = tx.clone();
             move || {
@@ -696,10 +710,6 @@ impl App {
                 let result = crate::core::set_rainbow_for_devices_summary(devices, true);
                 let _ = tx.send(AppEvent::RainbowComplete(result));
             }
-        });
-        self.pending_state_update = Some(PendingStateUpdate {
-            device_keys: self.enabled_device_keys(),
-            state: SavedState::Rainbow,
         });
     }
 
@@ -808,6 +818,12 @@ impl App {
                 sync_status,
                 Span::raw(" (press 's')"),
             ]));
+            if self.config.omarchy_sync_enabled {
+                settings_lines.push(Line::from(format!(
+                    "Sync scope locked to {}. Manual color/off/rainbow removes only affected devices, and removed devices stay out until you re-enable sync.",
+                    format_sync_scope(self.config.omarchy_sync_devices.len())
+                )));
+            }
             settings_lines.push(Line::from(
                 "Startup restore uses current Omarchy theme when sync is enabled.",
             ));
@@ -963,11 +979,20 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use super::filter_device_keys;
     use crate::core::config::AppConfig;
 
     #[test]
     fn startup_restore_toggle_defaults_off() {
         let config = AppConfig::default();
         assert!(!config.restore_on_startup);
+    }
+
+    #[test]
+    fn filter_device_keys_keeps_only_successful_keys() {
+        let requested = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let succeeded = vec!["b".to_string(), "c".to_string()];
+
+        assert_eq!(filter_device_keys(&requested, &succeeded), vec!["b", "c"]);
     }
 }

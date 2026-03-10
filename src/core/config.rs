@@ -17,6 +17,7 @@ pub enum SavedState {
 #[serde(default)]
 pub struct AppConfig {
     pub omarchy_sync_enabled: bool,
+    pub omarchy_sync_devices: HashSet<String>,
     pub restore_on_startup: bool,
     pub startup_delay_ms: u64,
     pub disabled_devices: HashSet<String>,
@@ -30,6 +31,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             omarchy_sync_enabled: false,
+            omarchy_sync_devices: HashSet::new(),
             restore_on_startup: false,
             startup_delay_ms: DEFAULT_STARTUP_DELAY_MS,
             disabled_devices: HashSet::new(),
@@ -89,6 +91,16 @@ impl AppConfig {
     pub fn get_saved_state_for_device(&self, device_key: &str) -> Option<&SavedState> {
         self.saved_device_states.get(device_key)
     }
+
+    pub fn set_omarchy_sync_devices(&mut self, device_keys: &[String]) {
+        self.omarchy_sync_devices = device_keys.iter().cloned().collect();
+    }
+
+    pub fn remove_omarchy_sync_devices(&mut self, device_keys: &[String]) {
+        for device_key in device_keys {
+            self.omarchy_sync_devices.remove(device_key);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -100,6 +112,7 @@ mod tests {
         let config: AppConfig = toml::from_str("omarchy_sync_enabled = true\n").unwrap();
 
         assert!(config.omarchy_sync_enabled);
+        assert!(config.omarchy_sync_devices.is_empty());
         assert!(!config.restore_on_startup);
         assert_eq!(config.startup_delay_ms, DEFAULT_STARTUP_DELAY_MS);
         assert!(config.saved_device_states.is_empty());
@@ -133,5 +146,21 @@ mod tests {
         assert!(content.contains("saved_device_states"));
         assert!(content.contains("msi::motherboard"));
         assert!(content.contains("kind = \"rainbow\""));
+    }
+
+    #[test]
+    fn omarchy_sync_device_scope_can_be_set_and_removed_incrementally() {
+        let mut config = AppConfig::default();
+        config.set_omarchy_sync_devices(&[
+            "gpu::gpu".to_string(),
+            "keyboard::keyboard".to_string(),
+            "mouse::mouse".to_string(),
+        ]);
+
+        config.remove_omarchy_sync_devices(&["keyboard::keyboard".to_string()]);
+
+        assert!(config.omarchy_sync_devices.contains("gpu::gpu"));
+        assert!(config.omarchy_sync_devices.contains("mouse::mouse"));
+        assert!(!config.omarchy_sync_devices.contains("keyboard::keyboard"));
     }
 }

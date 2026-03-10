@@ -96,10 +96,7 @@ pub fn perform_sync(force: bool) -> Result<(), String> {
 
     let enabled_devices: Vec<_> = devices
         .into_iter()
-        .filter(|device| {
-            let profile_key = openrgb::device_profile_key(device);
-            !conf.is_device_disabled(&profile_key, &device.name)
-        })
+        .filter(|device| sync_target_contains(&conf, device))
         .collect();
 
     let summary = apply_color_to_devices_summary(enabled_devices, &hex_color, true);
@@ -152,23 +149,37 @@ fn restore_once(conf: &AppConfig) -> Result<(), String> {
 
     let _ = openrgb::refresh_device_ids(&mut devices);
 
-    if conf.omarchy_sync_enabled {
-        let managed_devices: Vec<_> = devices
-            .into_iter()
-            .filter(|device| {
-                let profile_key = openrgb::device_profile_key(device);
-                !conf.is_device_disabled(&profile_key, &device.name)
-            })
-            .collect();
+    let mut omarchy_devices = Vec::new();
+    let mut saved_state_devices = Vec::new();
 
-        if managed_devices.is_empty() {
-            return Ok(());
+    for device in devices {
+        let profile_key = openrgb::device_profile_key(&device);
+        if conf.omarchy_sync_enabled && conf.omarchy_sync_devices.contains(&profile_key) {
+            omarchy_devices.push(device);
+        } else {
+            saved_state_devices.push(device);
         }
-
-        return apply_theme_to_devices(managed_devices, false);
     }
 
-    restore_saved_device_states(conf, devices)
+    let mut failures = Vec::new();
+
+    if conf.omarchy_sync_enabled && !omarchy_devices.is_empty() {
+        match restore_theme_to_devices(omarchy_devices) {
+            Ok(()) => {}
+            Err(err) => failures.push(err),
+        }
+    }
+
+    match restore_saved_device_states(conf, saved_state_devices) {
+        Ok(()) => {}
+        Err(err) => failures.push(err),
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join(" | "))
+    }
 }
 
 fn validate_restore_config(conf: &AppConfig) -> Result<(), String> {
@@ -179,6 +190,15 @@ fn validate_restore_config(conf: &AppConfig) -> Result<(), String> {
         Ok(())
     } else {
         Err("No saved RGB state to restore yet. Set a manual color or turn lights off once before using startup restore.".to_string())
+    }
+}
+
+fn sync_target_contains(conf: &AppConfig, device: &openrgb::OpenRgbDevice) -> bool {
+    let profile_key = openrgb::device_profile_key(device);
+    if conf.omarchy_sync_enabled {
+        conf.omarchy_sync_devices.contains(&profile_key)
+    } else {
+        !conf.is_device_disabled(&profile_key, &device.name)
     }
 }
 
@@ -213,60 +233,44 @@ fn restore_saved_device_states(
     }
 
     let mut failures = Vec::new();
-    let mut successes = 0;
 
     for (hex, grouped_devices) in color_groups {
-        match apply_color_to_devices_lenient(grouped_devices, &hex) {
-            Ok(()) => successes += 1,
-            Err(err) => failures.push(err),
+        let summary = apply_color_to_devices_summary(grouped_devices, &hex, false);
+        if !summary.failed_devices.is_empty() {
+            failures.push(summary.failed_devices.join(" | "));
         }
     }
 
     if !off_devices.is_empty() {
-        match apply_color_to_devices_lenient(off_devices, "000000") {
-            Ok(()) => successes += 1,
-            Err(err) => failures.push(err),
+        let summary = apply_color_to_devices_summary(off_devices, "000000", false);
+        if !summary.failed_devices.is_empty() {
+            failures.push(summary.failed_devices.join(" | "));
         }
     }
 
     if !rainbow_devices.is_empty() {
-        match set_rainbow_for_devices_lenient(rainbow_devices) {
-            Ok(()) => successes += 1,
-            Err(err) => failures.push(err),
+        let summary = set_rainbow_for_devices_summary(rainbow_devices, false);
+        if !summary.failed_devices.is_empty() {
+            failures.push(summary.failed_devices.join(" | "));
         }
     }
 
-    if failures.is_empty() || successes > 0 {
+    if failures.is_empty() {
         Ok(())
     } else {
         Err(failures.join(" | "))
     }
 }
 
-fn apply_theme_to_devices(
-    devices: Vec<openrgb::OpenRgbDevice>,
-    fail_on_partial: bool,
-) -> Result<(), String> {
+fn restore_theme_to_devices(devices: Vec<openrgb::OpenRgbDevice>) -> Result<(), String> {
     let hex_color = load_theme_color()?;
-    if fail_on_partial {
-        apply_color_to_devices(devices, &hex_color)
+    let summary = apply_color_to_devices_summary(devices, &hex_color, false);
+
+    if summary.failed_devices.is_empty() {
+        Ok(())
     } else {
-        apply_color_to_devices_lenient(devices, &hex_color)
+        Err(summary.failed_devices.join(" | "))
     }
-}
-
-pub fn apply_color_to_devices(
-    devices: Vec<openrgb::OpenRgbDevice>,
-    color: &str,
-) -> Result<(), String> {
-    apply_color_to_devices_summary(devices, color, true).into_result()
-}
-
-fn apply_color_to_devices_lenient(
-    devices: Vec<openrgb::OpenRgbDevice>,
-    color: &str,
-) -> Result<(), String> {
-    apply_color_to_devices_summary(devices, color, false).into_result()
 }
 
 pub fn apply_color_to_devices_summary(
@@ -376,10 +380,6 @@ struct DeviceApplyStatus {
     failure: Option<String>,
 }
 
-fn set_rainbow_for_devices_lenient(devices: Vec<openrgb::OpenRgbDevice>) -> Result<(), String> {
-    set_rainbow_for_devices_summary(devices, false).into_result()
-}
-
 pub fn set_rainbow_for_devices_summary(
     devices: Vec<openrgb::OpenRgbDevice>,
     fail_on_partial: bool,
@@ -415,12 +415,17 @@ impl DeviceActionSummary {
 #[cfg(test)]
 mod restore_tests {
     use super::{
-        apply_color_to_devices, set_rainbow_for_devices_summary, validate_restore_config, AppConfig,
+        apply_color_to_devices_summary, restore_theme_to_devices, set_rainbow_for_devices_summary,
+        sync_target_contains, validate_restore_config, AppConfig,
     };
+    use crate::core::config::SavedState;
+    use crate::core::openrgb::OpenRgbDevice;
 
     #[test]
     fn apply_color_to_devices_succeeds_for_empty_list() {
-        assert_eq!(apply_color_to_devices(Vec::new(), "ffffff"), Ok(()));
+        assert!(apply_color_to_devices_summary(Vec::new(), "ffffff", true)
+            .failed_devices
+            .is_empty());
     }
 
     #[test]
@@ -449,5 +454,59 @@ mod restore_tests {
         };
 
         assert!(validate_restore_config(&config).is_ok());
+    }
+
+    #[test]
+    fn omarchy_sync_does_not_fall_back_to_live_checkbox_state() {
+        let mut config = AppConfig {
+            omarchy_sync_enabled: true,
+            ..AppConfig::default()
+        };
+        config.disabled_devices.clear();
+
+        let device = OpenRgbDevice {
+            id: 1,
+            name: "Keyboard".to_string(),
+            device_type: "Keyboard".to_string(),
+        };
+
+        assert!(!sync_target_contains(&config, &device));
+    }
+
+    #[test]
+    fn mixed_restore_scope_routes_synced_and_manual_devices_differently() {
+        let mut config = AppConfig {
+            omarchy_sync_enabled: true,
+            ..AppConfig::default()
+        };
+        config.set_omarchy_sync_devices(&["mouse::mouse".to_string()]);
+        config.saved_device_states.insert(
+            "motherboard::motherboard".to_string(),
+            SavedState::Color {
+                hex: "ff0000".to_string(),
+            },
+        );
+
+        let mouse = OpenRgbDevice {
+            id: 1,
+            name: "Mouse".to_string(),
+            device_type: "Mouse".to_string(),
+        };
+        let motherboard = OpenRgbDevice {
+            id: 2,
+            name: "Motherboard".to_string(),
+            device_type: "Motherboard".to_string(),
+        };
+
+        assert!(sync_target_contains(&config, &mouse));
+        assert!(!sync_target_contains(&config, &motherboard));
+        assert!(config
+            .get_saved_state_for_device("motherboard::motherboard")
+            .is_some());
+    }
+
+    #[test]
+    fn restore_theme_to_devices_succeeds_for_empty_list() {
+        assert_eq!(restore_theme_to_devices(Vec::new()), Ok(()));
     }
 }
