@@ -34,3 +34,7 @@ PLAN.md
 BUGS.md
 WORKFLOW.md
 DEV.md
+
+# Local agent tooling
+.claude/
+.codemux/
