@@ -4,7 +4,7 @@ pub mod openrgb;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -30,56 +30,229 @@ impl DeviceActionSummary {
 }
 
 pub fn load_theme_color() -> Result<String, String> {
-    let mut theme_path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
-    theme_path.push(".config/omarchy/current/theme/colors.toml");
-
-    let content = fs::read_to_string(&theme_path)
-        .map_err(|e| format!("Failed to read colors.toml: {}", e))?;
-
-    parse_theme_color(&content).ok_or_else(|| "No color found in theme".to_string())
+    let candidates = theme_color_candidates()?;
+    load_theme_color_from_candidates(&candidates, |path| fs::read_to_string(path))
 }
 
-fn parse_theme_color(content: &str) -> Option<String> {
-    let mut accent_color = None;
-
-    for line in content.lines() {
-        if line.starts_with("rgb") || line.starts_with("accent") {
-            let parts: Vec<&str> = line.split('=').collect();
-            if parts.len() == 2 {
-                let color = parts[1]
-                    .trim()
-                    .trim_matches('"')
-                    .trim_start_matches('#')
-                    .to_string();
-                if !color.is_empty() {
-                    if line.starts_with("rgb") {
-                        return Some(color);
-                    }
-                    if accent_color.is_none() {
-                        accent_color = Some(color);
-                    }
-                }
+fn load_theme_color_from_candidates<F>(
+    candidates: &[PathBuf],
+    mut read_to_string: F,
+) -> Result<String, String>
+where
+    F: FnMut(&Path) -> std::io::Result<String>,
+{
+    for theme_path in candidates {
+        match read_to_string(theme_path) {
+            Ok(content) => {
+                return parse_theme_color(&content).map_err(|error| {
+                    format!(
+                        "Invalid Omarchy theme colors at {}: {}",
+                        theme_path.display(),
+                        error
+                    )
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to read Omarchy theme colors at {}: {}",
+                    theme_path.display(),
+                    error
+                ))
             }
         }
     }
 
-    accent_color
+    let checked = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Err(format!(
+        "Omarchy theme colors were not found; checked {}",
+        checked
+    ))
+}
+
+fn theme_color_candidates() -> Result<Vec<PathBuf>, String> {
+    let home_dir = dirs::home_dir()
+        .ok_or_else(|| "Could not determine the user home directory".to_string())?;
+    Ok(theme_color_candidates_from(
+        &home_dir,
+        dirs::state_dir(),
+        dirs::config_dir(),
+    ))
+}
+
+fn theme_color_candidates_from(
+    home_dir: &Path,
+    state_dir: Option<PathBuf>,
+    config_dir: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    // Omarchy Quattro writes the active theme to this exact per-user state path.
+    push_unique(
+        &mut candidates,
+        home_dir.join(".local/state/omarchy/current/theme/colors.toml"),
+    );
+
+    // Also honor a custom XDG state directory when it differs from Omarchy's default.
+    if let Some(state_dir) = state_dir {
+        push_unique(
+            &mut candidates,
+            state_dir.join("omarchy/current/theme/colors.toml"),
+        );
+    }
+
+    // Omarchy 3.x kept the active theme below ~/.config.
+    push_unique(
+        &mut candidates,
+        home_dir.join(".config/omarchy/current/theme/colors.toml"),
+    );
+
+    // Retain compatibility with a customized XDG config directory as a last resort.
+    if let Some(config_dir) = config_dir {
+        push_unique(
+            &mut candidates,
+            config_dir.join("omarchy/current/theme/colors.toml"),
+        );
+    }
+
+    candidates
+}
+
+fn push_unique(candidates: &mut Vec<PathBuf>, path: PathBuf) {
+    if !candidates.contains(&path) {
+        candidates.push(path);
+    }
+}
+
+fn parse_theme_color(content: &str) -> Result<String, String> {
+    let colors = content
+        .parse::<toml::Value>()
+        .map_err(|error| format!("invalid TOML: {}", error))?;
+
+    for key in ["rgb", "accent"] {
+        if let Some(value) = colors.get(key) {
+            let raw_color = value
+                .as_str()
+                .ok_or_else(|| format!("{} must be a string", key))?;
+            let color = raw_color
+                .trim()
+                .strip_prefix('#')
+                .unwrap_or(raw_color.trim());
+
+            if color.len() == 6 && color.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Ok(color.to_string());
+            }
+
+            return Err(format!(
+                "{} must be a six-digit hexadecimal color, got {:?}",
+                key, raw_color
+            ));
+        }
+    }
+
+    Err("no rgb or accent color was defined".to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_theme_color;
+    use super::{load_theme_color_from_candidates, parse_theme_color, theme_color_candidates_from};
+    use std::{io, path::PathBuf};
 
     #[test]
     fn prefers_rgb_over_accent_when_both_exist() {
         let content = "accent = \"#112233\"\nrgb = \"#445566\"\n";
-        assert_eq!(parse_theme_color(content), Some("445566".to_string()));
+        assert_eq!(parse_theme_color(content).unwrap(), "445566");
     }
 
     #[test]
     fn falls_back_to_accent_when_rgb_missing() {
         let content = "accent = \"#112233\"\n";
-        assert_eq!(parse_theme_color(content), Some("112233".to_string()));
+        assert_eq!(parse_theme_color(content).unwrap(), "112233");
+    }
+
+    #[test]
+    fn parses_valid_toml_instead_of_matching_line_prefixes() {
+        let content = "# theme palette\n  accent = \"#Aa12fF\"\n";
+        assert_eq!(parse_theme_color(content).unwrap(), "Aa12fF");
+    }
+
+    #[test]
+    fn rejects_invalid_theme_colors() {
+        let error = parse_theme_color("accent = \"blue\"\n").unwrap_err();
+        assert!(error.contains("six-digit hexadecimal"));
+    }
+
+    #[test]
+    fn checks_official_quattro_state_before_xdg_and_legacy_paths() {
+        let candidates = theme_color_candidates_from(
+            std::path::Path::new("/home/test"),
+            Some(PathBuf::from("/tmp/state")),
+            Some(PathBuf::from("/tmp/config")),
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/home/test/.local/state/omarchy/current/theme/colors.toml"),
+                PathBuf::from("/tmp/state/omarchy/current/theme/colors.toml"),
+                PathBuf::from("/home/test/.config/omarchy/current/theme/colors.toml"),
+                PathBuf::from("/tmp/config/omarchy/current/theme/colors.toml"),
+            ]
+        );
+    }
+
+    #[test]
+    fn does_not_duplicate_default_xdg_paths() {
+        let candidates = theme_color_candidates_from(
+            std::path::Path::new("/home/test"),
+            Some(PathBuf::from("/home/test/.local/state")),
+            Some(PathBuf::from("/home/test/.config")),
+        );
+
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn falls_back_to_legacy_theme_when_quattro_state_is_missing() {
+        let quattro = PathBuf::from("/tmp/state/omarchy/current/theme/colors.toml");
+        let legacy = PathBuf::from("/tmp/config/omarchy/current/theme/colors.toml");
+        let candidates = vec![quattro.clone(), legacy.clone()];
+        let mut visited = Vec::new();
+
+        let color = load_theme_color_from_candidates(&candidates, |path| {
+            visited.push(path.to_path_buf());
+            if path == quattro {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            } else {
+                Ok("accent = \"#abcdef\"\n".to_string())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(color, "abcdef");
+        assert_eq!(visited, vec![quattro, legacy]);
+    }
+
+    #[test]
+    fn does_not_hide_an_invalid_quattro_theme_with_a_legacy_fallback() {
+        let quattro = PathBuf::from("/tmp/state/omarchy/current/theme/colors.toml");
+        let legacy = PathBuf::from("/tmp/config/omarchy/current/theme/colors.toml");
+        let candidates = vec![quattro.clone(), legacy];
+        let mut visited = Vec::new();
+
+        let error = load_theme_color_from_candidates(&candidates, |path| {
+            visited.push(path.to_path_buf());
+            Ok("accent = \"not-a-color\"\n".to_string())
+        })
+        .unwrap_err();
+
+        assert!(error.contains("Invalid Omarchy theme colors"));
+        assert_eq!(visited, vec![quattro]);
     }
 }
 
@@ -87,6 +260,12 @@ pub fn perform_sync(force: bool) -> Result<(), String> {
     let mut conf = AppConfig::load();
     if !conf.omarchy_sync_enabled && !force {
         return Ok(());
+    }
+
+    // Existing 3.x installations may invoke us from the former flat hook. Migrate
+    // only when needed so normal Quattro theme events do not rewrite hook config.
+    if conf.omarchy_sync_enabled {
+        hook::migrate_hook_if_needed()?;
     }
 
     let hex_color = load_theme_color()?;

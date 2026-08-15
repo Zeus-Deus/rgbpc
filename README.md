@@ -11,7 +11,7 @@ A TUI application for managing your PC's RGB lighting via OpenRGB. Control all y
 - **Rainbow Mode:** One key to set all enabled devices to a rainbow/spectrum cycle effect.
 - **Fail-Safe Compatibility:** Tries multiple OpenRGB modes (`Direct`, `Static`, zone resizing) to maximize hardware compatibility.
 - **Startup Restore:** Optionally restore the whole remembered device setup at login with a one-shot startup command, even if you only changed one device last time.
-- **Omarchy Theme Sync** _(Omarchy users only)_: Automatically reads your `colors.toml` and syncs your current theme's accent color to all enabled devices. Includes a one-click hook installer for `~/.config/omarchy/hooks/theme-set`.
+- **Omarchy Theme Sync** _(Omarchy users only)_: Automatically reads your `colors.toml` and syncs your current theme's accent color to all enabled devices. Omarchy Quattro's active-theme state layout is supported, with a fallback for Omarchy 3.x, and the one-click installer uses the modular `~/.config/omarchy/hooks/theme-set.d/rgbpc` hook.
 
 ## Installation
 

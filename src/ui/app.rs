@@ -182,11 +182,11 @@ impl App {
                                     KeyCode::Backspace => {
                                         self.custom_hex_input.pop();
                                     }
-                                    KeyCode::Char(c) => {
-                                        if c.is_ascii_hexdigit() && self.custom_hex_input.len() < 6
-                                        {
-                                            self.custom_hex_input.push(c);
-                                        }
+                                    KeyCode::Char(c)
+                                        if c.is_ascii_hexdigit()
+                                            && self.custom_hex_input.len() < 6 =>
+                                    {
+                                        self.custom_hex_input.push(c);
                                     }
                                     _ => {}
                                 }
@@ -198,7 +198,7 @@ impl App {
                                             "Color picker cancelled.".to_string();
                                     }
                                     KeyCode::Left | KeyCode::Char('h') => {
-                                        if self.selected_color_index % 6 > 0 {
+                                        if !self.selected_color_index.is_multiple_of(6) {
                                             self.selected_color_index -= 1;
                                         }
                                     }
@@ -229,17 +229,16 @@ impl App {
                             }
                         }
                     }
-                    Event::Mouse(mouse) => {
-                        if self.mode == AppMode::ColorPicker {
-                            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                                self.handle_mouse_click(
-                                    mouse.column,
-                                    mouse.row,
-                                    terminal.size().unwrap_or_default(),
-                                    &tx,
-                                );
-                            }
-                        }
+                    Event::Mouse(mouse)
+                        if self.mode == AppMode::ColorPicker
+                            && mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
+                    {
+                        self.handle_mouse_click(
+                            mouse.column,
+                            mouse.row,
+                            terminal.size().unwrap_or_default(),
+                            &tx,
+                        );
                     }
                     _ => {}
                 }
