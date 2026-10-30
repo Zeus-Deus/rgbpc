@@ -37,5 +37,8 @@ while True:
                     count += 1
                     if mode == "drop" or (mode == "drop-after-two" and count == 2):
                         sys.exit(0)
+                elif packet == 40 and mode != "mute":
+                    # The legacy peer advertises no newer SDK capabilities.
+                    connection.sendall(struct.pack("<4sIIII", b"ORGB", device, 40, 4, 0))
         except (OSError, TimeoutError):
             pass

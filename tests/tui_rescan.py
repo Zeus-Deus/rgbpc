@@ -12,8 +12,13 @@ import subprocess
 import sys
 import termios
 import time
+import tomllib
 
 binary, root = sys.argv[1], Path(sys.argv[2])
+(root / '.config/omarchy').mkdir(parents=True)
+theme = root / '.local/state/omarchy/current/theme/colors.toml'
+theme.parent.mkdir(parents=True)
+theme.write_text('rgb = "#1234ab"\n')
 master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 120, 0, 0))
 
@@ -36,8 +41,8 @@ def drain():
             break
         transcript.extend(part)
 
-def visible():
-    return re.sub(rb'\s', b'', re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', bytes(transcript)))
+def visible(start=0):
+    return re.sub(rb'\s', b'', re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', bytes(transcript[start:])))
 
 def until(predicate, timeout=10):
     deadline = time.monotonic() + timeout
@@ -80,6 +85,21 @@ try:
     os.write(master, b'll\r')
     until(lambda: b'Colorcommandsaccepted' in visible())
     assert server_starts() == 2, 'warm color update unnecessarily restarted the rescan server'
+    sync_started = len(transcript)
+    os.write(master, b't')
+    # Differential redraw may retain the existing "Sync" prefix on screen.
+    until(lambda: b'commandsaccepted' in visible(sync_started))
+    config_path = root / 'config/rgbpc/config.toml'
+    def config():
+        try:
+            return tomllib.loads(config_path.read_text())
+        except tomllib.TOMLDecodeError:
+            return {}
+    key = 'msi test board::motherboard'
+    assert config()['saved_device_states'][key]['hex'] == '1234ab'
+    os.write(master, b'a')
+    until(lambda: config().get('restore_on_startup') is False)
+    assert config()['saved_device_states'][key]['hex'] == '1234ab', 'settings toggle overwrote the completed theme sync with stale TUI state'
     os.write(master, b'q')
     process.wait(timeout=5)
     assert process.returncode == 0

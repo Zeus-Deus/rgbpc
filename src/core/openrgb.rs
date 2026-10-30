@@ -179,6 +179,15 @@ pub fn apply_color(device: &OpenRgbDevice, color_hex: &str) -> Result<ApplyResul
     for attempt in attempts {
         match apply_strategy(device.id, color, attempt.kind) {
             Ok(true) => {
+                let preferred_mode = match attempt.kind {
+                    StrategyKind::CustomThenColor => Some("Custom"),
+                    StrategyKind::DirectThenColor => Some("Direct"),
+                    StrategyKind::StaticThenColor | StrategyKind::FullFallback => Some("Static"),
+                    StrategyKind::ColorOnly | StrategyKind::ZoneResizeThenColor => None,
+                };
+                // Retain every compatibility command before checking the
+                // server. A child exit status alone cannot confirm delivery.
+                super::session::finish_solid_color(device, color, preferred_mode)?;
                 return Ok(ApplyResult {
                     needs_retry: attempt.needs_retry,
                 });

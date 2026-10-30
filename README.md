@@ -45,6 +45,10 @@ Just run `rgbpc`. It automatically reuses a local OpenRGB server or starts a tem
 
 The first detection still takes time; subsequent changes in the same session avoid repeating it. RGBPC stops its own server on exit and leaves existing user-owned servers running. No permanent service is installed. Acceleration is transport-level, not specific to a case, motherboard, or fan brand; hardware support still comes from OpenRGB.
 
+For servers supporting SDK v3 or later, solid-color actions also finish with a **capability-checked state confirmation** after the existing CLI commands. If necessary, RGBPC selects the advertised programmable color mechanism, sends the requested color, and reads the result back over the same connection before saving success. Device IDs, modes and color-slot counts come from fresh server metadata; no motherboard names, learned strategies or fixed LED counts are used for this finish. Unrelated brightness/speed settings are preserved, and no extra zone resizing or hardware-profile saves are introduced. Older SDKs and unsupported modes retain the CLI compatibility path.
+
+This check runs only during an action—there is no new daemon or idle polling. A server-state mismatch is an error, not a saved successful color. A matching readback confirms OpenRGB's state, **not** independent observation of the physical LEDs.
+
 The helper is **session-scoped**, not an always-running daemon: it stays available while the TUI is open and stops when RGBPC quits. A noninteractive color/sync/restore command stops its own helper when that command finishes. After a reboot, the next launch creates a fresh session; optional login restore is still a one-shot command. RGBPC never stops a server it did not start.
 
 The TUI redraws only after input, resize, or an action result, not on a repeating repaint timer. Idle RGBPC does not repeatedly rediscover hardware. OpenRGB still occupies memory and may do its own background work while the session is open; resource usage depends on its build and detected devices, so it is not a zero-resource process.
@@ -74,6 +78,8 @@ These commands work without opening the TUI:
 | `rgbpc --restore-last` | Restore remembered states when startup restore is enabled |
 
 `--device` can be repeated. Disabled devices are not silently overridden; missing or ambiguous selectors are errors. IDs may change after hardware detection, so use a unique listed key or exact name for repeated automation. Identical controllers sharing an identity cannot be targeted as a subset safely during compatibility retries.
+
+In the TUI, `t` explicitly applies the current theme to the currently enabled devices, including after a manual color change. Automatic theme hooks still use their separately saved sync scope; a one-shot force sync does not silently add devices to that scope.
 
 Add `--json` for scripts and automation, for example `rgbpc --list-devices --json` or `rgbpc --color 0080FF --json`. Output is one JSON object on stdout, with `schema_version: 1`; diagnostics use stderr. Direct color/off/rainbow and enabled theme-sync results include `ok`, `accepted_devices`, `errors`, and `verification: "command_acceptance"`. Success means command-level acceptance, **not** independent verification of physical LEDs.
 

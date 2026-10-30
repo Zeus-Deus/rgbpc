@@ -438,7 +438,7 @@ pub fn perform_sync_summary(force: bool) -> Result<DeviceActionSummary, String> 
 
     let enabled_devices: Vec<_> = devices
         .into_iter()
-        .filter(|device| sync_target_contains(&conf, device))
+        .filter(|device| sync_target_for_action(&conf, device, force))
         .collect();
 
     let mut summary = apply_color_to_devices_summary(enabled_devices, &hex_color, true);
@@ -555,6 +555,17 @@ fn validate_restore_config(conf: &AppConfig) -> Result<(), String> {
     }
 }
 
+fn sync_target_for_action(conf: &AppConfig, device: &openrgb::OpenRgbDevice, force: bool) -> bool {
+    if force {
+        // An explicit T action targets today's enabled selection. Automatic
+        // hooks retain their independently saved scope, even when it is empty.
+        let key = openrgb::device_profile_key(device);
+        !conf.is_device_disabled(&key, &device.name)
+    } else {
+        sync_target_contains(conf, device)
+    }
+}
+
 fn sync_target_contains(conf: &AppConfig, device: &openrgb::OpenRgbDevice) -> bool {
     let profile_key = openrgb::device_profile_key(device);
     if conf.omarchy_sync_enabled {
@@ -640,42 +651,50 @@ pub fn apply_color_to_devices_summary(
     color: &str,
     fail_on_partial: bool,
 ) -> DeviceActionSummary {
+    apply_color_to_devices_summary_with(
+        devices,
+        color,
+        fail_on_partial,
+        openrgb::apply_color,
+        || {
+            thread::sleep(Duration::from_millis(1500));
+            openrgb::list_devices()
+        },
+    )
+}
+
+// Keep transport and settling at the boundary so accounting is testable without hardware.
+fn apply_color_to_devices_summary_with(
+    devices: Vec<openrgb::OpenRgbDevice>,
+    color: &str,
+    fail_on_partial: bool,
+    mut apply: impl FnMut(&openrgb::OpenRgbDevice, &str) -> Result<openrgb::ApplyResult, String>,
+    discover: impl FnOnce() -> Result<Vec<openrgb::OpenRgbDevice>, String>,
+) -> DeviceActionSummary {
     let mut device_results = HashMap::new();
     let mut retry_keys = HashSet::new();
+    let mut initial_counts = HashMap::new();
 
     for device in devices {
         let key = openrgb::device_profile_key(&device);
         let name = device.name.clone();
+        *initial_counts.entry(key.clone()).or_insert(0_usize) += 1;
 
-        match openrgb::apply_color(&device, color) {
-            Ok(result) => {
-                device_results.insert(
-                    key.clone(),
-                    DeviceApplyStatus {
-                        name,
-                        success: true,
-                        failure: None,
-                    },
-                );
-                if result.needs_retry {
-                    retry_keys.insert(key);
-                }
-            }
-            Err(err) => {
-                device_results.insert(
-                    key.clone(),
-                    DeviceApplyStatus {
-                        name,
-                        success: false,
-                        failure: Some(err),
-                    },
-                );
-                retry_keys.insert(key);
-            }
+        let result = apply(&device, color);
+        if result.as_ref().map_or(true, |result| result.needs_retry) {
+            retry_keys.insert(key.clone());
         }
+        record_color_status(&mut device_results, key, name, result.map(|_| ()));
     }
 
-    retry_color_for_profile_keys(&retry_keys, color, &mut device_results);
+    retry_color_for_profile_keys(
+        &retry_keys,
+        &initial_counts,
+        color,
+        &mut device_results,
+        &mut apply,
+        discover,
+    );
 
     let mut failures = Vec::new();
     let mut succeeded_keys = Vec::new();
@@ -701,36 +720,85 @@ pub fn apply_color_to_devices_summary(
 
 fn retry_color_for_profile_keys(
     profile_keys: &HashSet<String>,
+    initial_counts: &HashMap<String, usize>,
     color: &str,
     device_results: &mut HashMap<String, DeviceApplyStatus>,
+    apply: &mut impl FnMut(&openrgb::OpenRgbDevice, &str) -> Result<openrgb::ApplyResult, String>,
+    discover: impl FnOnce() -> Result<Vec<openrgb::OpenRgbDevice>, String>,
 ) {
     if profile_keys.is_empty() {
         return;
     }
 
-    thread::sleep(Duration::from_millis(1500));
-
-    let Ok(devices) = openrgb::list_devices() else {
-        return;
+    let devices = match discover() {
+        Ok(devices) => devices,
+        Err(err) => {
+            for key in profile_keys {
+                if let Some(status) = device_results.get_mut(key) {
+                    status.success = false;
+                    status.failure = Some(format!("Retry discovery failed: {err}"));
+                }
+            }
+            return;
+        }
     };
 
+    let mut fresh_counts = HashMap::new();
+    for device in &devices {
+        let key = openrgb::device_profile_key(device);
+        *fresh_counts.entry(key).or_insert(0_usize) += 1;
+    }
+
+    let mut valid_keys = HashSet::new();
+    for key in profile_keys {
+        let found = fresh_counts.get(key).copied().unwrap_or(0);
+        let expected = initial_counts[key];
+        // Profile keys identify groups, not individual controllers. Do not
+        // write a changed group or accept stale success from its first pass.
+        if found != expected {
+            if let Some(status) = device_results.get_mut(key) {
+                status.success = false;
+                status.failure = Some(format!(
+                    "Retry device group changed: expected {expected}, found {found}"
+                ));
+            }
+        } else {
+            valid_keys.insert(key);
+        }
+    }
+
+    let mut retry_results = HashMap::new();
     for device in devices {
         let key = openrgb::device_profile_key(&device);
-        if !profile_keys.contains(&key) {
-            continue;
+        if valid_keys.contains(&key) {
+            record_color_status(
+                &mut retry_results,
+                key,
+                device.name.clone(),
+                apply(&device, color).map(|_| ()),
+            );
         }
+    }
+    // Replace complete groups only: a fully successful retry can recover an
+    // earlier failure, but one successful member must not clear its peers.
+    device_results.extend(retry_results);
+}
 
-        if openrgb::apply_color(&device, color).is_ok() {
-            let entry = device_results
-                .entry(key)
-                .or_insert_with(|| DeviceApplyStatus {
-                    name: device.name.clone(),
-                    success: false,
-                    failure: None,
-                });
-            entry.name = device.name.clone();
-            entry.success = true;
-            entry.failure = None;
+fn record_color_status(
+    results: &mut HashMap<String, DeviceApplyStatus>,
+    key: String,
+    name: String,
+    result: Result<(), String>,
+) {
+    let entry = results.entry(key).or_insert_with(|| DeviceApplyStatus {
+        name,
+        success: true,
+        failure: None,
+    });
+    if let Err(err) = result {
+        entry.success = false;
+        if entry.failure.is_none() {
+            entry.failure = Some(err);
         }
     }
 }
@@ -892,6 +960,24 @@ mod restore_tests {
     }
 
     #[test]
+    fn explicit_force_sync_uses_enabled_devices_without_broadening_automatic_scope() {
+        let mut config = AppConfig {
+            omarchy_sync_enabled: true,
+            ..AppConfig::default()
+        };
+        let device = OpenRgbDevice {
+            id: 1,
+            name: "Generic Board".to_string(),
+            device_type: "Motherboard".to_string(),
+        };
+        assert!(super::sync_target_for_action(&config, &device, true));
+        assert!(!super::sync_target_for_action(&config, &device, false));
+        assert!(config.omarchy_sync_devices.is_empty());
+        config.disabled_devices.insert(device.name.clone());
+        assert!(!super::sync_target_for_action(&config, &device, true));
+    }
+
+    #[test]
     fn mixed_restore_scope_routes_synced_and_manual_devices_differently() {
         let mut config = AppConfig {
             omarchy_sync_enabled: true,
@@ -926,5 +1012,251 @@ mod restore_tests {
     #[test]
     fn restore_theme_to_devices_succeeds_for_empty_list() {
         assert_eq!(restore_theme_to_devices(Vec::new()), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod bulk_accounting_tests {
+    use super::*;
+
+    fn device(id: u32) -> openrgb::OpenRgbDevice {
+        openrgb::OpenRgbDevice {
+            id,
+            name: "Generic Board".into(),
+            device_type: "Motherboard".into(),
+        }
+    }
+
+    #[test]
+    fn failed_last_pass_invalidates_initial_success() {
+        let mut calls = 0;
+        let summary = apply_color_to_devices_summary_with(
+            vec![device(1)],
+            "123456",
+            false,
+            |_, _| {
+                calls += 1;
+                if calls == 1 {
+                    Ok(openrgb::ApplyResult { needs_retry: true })
+                } else {
+                    Err("final postcondition failed".into())
+                }
+            },
+            || Ok(vec![device(9)]),
+        );
+        assert_eq!(calls, 2);
+        assert!(summary.succeeded_keys.is_empty());
+        assert_eq!(
+            summary.failed_devices,
+            vec!["Generic Board: final postcondition failed"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod bulk_duplicate_tests {
+    use super::*;
+
+    #[test]
+    fn same_key_failure_then_success_keeps_first_error() {
+        let mut results = HashMap::new();
+        record_color_status(
+            &mut results,
+            "same".into(),
+            "Generic Board".into(),
+            Err("first".into()),
+        );
+        record_color_status(&mut results, "same".into(), "Generic Board".into(), Ok(()));
+        record_color_status(
+            &mut results,
+            "same".into(),
+            "Generic Board".into(),
+            Err("second".into()),
+        );
+        record_color_status(&mut results, "same".into(), "Generic Board".into(), Ok(()));
+        assert!(!results["same"].success);
+        assert_eq!(results["same"].failure.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn retry_duplicate_failure_is_not_masked_by_later_success() {
+        let devices = vec![
+            openrgb::OpenRgbDevice {
+                id: 1,
+                name: "Generic Board".into(),
+                device_type: "Motherboard".into(),
+            },
+            openrgb::OpenRgbDevice {
+                id: 2,
+                name: "Generic Board".into(),
+                device_type: "Motherboard".into(),
+            },
+        ];
+        let roster = devices.clone();
+        let mut calls = 0;
+        let summary = apply_color_to_devices_summary_with(
+            devices,
+            "123456",
+            false,
+            |device, _| {
+                calls += 1;
+                if calls > 2 && device.id == 1 {
+                    Err("first retry member failed".into())
+                } else {
+                    Ok(openrgb::ApplyResult { needs_retry: true })
+                }
+            },
+            || Ok(roster),
+        );
+        assert_eq!(calls, 4);
+        assert!(summary.succeeded_keys.is_empty());
+        assert_eq!(
+            summary.failed_devices,
+            vec!["Generic Board: first retry member failed"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod bulk_roster_tests {
+    use super::*;
+
+    fn device(id: u32) -> openrgb::OpenRgbDevice {
+        openrgb::OpenRgbDevice {
+            id,
+            name: "Generic Board".into(),
+            device_type: "Motherboard".into(),
+        }
+    }
+
+    #[test]
+    fn retry_discovery_error_invalidates_prior_success() {
+        let mut calls = 0;
+        let summary = apply_color_to_devices_summary_with(
+            vec![device(1)],
+            "123456",
+            false,
+            |_, _| {
+                calls += 1;
+                Ok(openrgb::ApplyResult { needs_retry: true })
+            },
+            || Err("fresh discovery unavailable".into()),
+        );
+        assert_eq!(calls, 1);
+        assert!(summary.succeeded_keys.is_empty());
+        assert!(summary.failed_devices[0].contains("fresh discovery unavailable"));
+    }
+
+    fn rejects_roster(roster: Vec<openrgb::OpenRgbDevice>, expected_found: usize) {
+        let mut calls = 0;
+        let summary = apply_color_to_devices_summary_with(
+            vec![device(1), device(2)],
+            "123456",
+            false,
+            |_, _| {
+                calls += 1;
+                Ok(openrgb::ApplyResult { needs_retry: true })
+            },
+            || Ok(roster),
+        );
+        assert_eq!(calls, 2, "changed group must receive no retry writes");
+        assert!(summary.succeeded_keys.is_empty());
+        assert!(summary.failed_devices[0].contains(&format!("expected 2, found {expected_found}")));
+    }
+
+    #[test]
+    fn retry_missing_group_invalidates_prior_success() {
+        rejects_roster(vec![], 0);
+    }
+
+    #[test]
+    fn retry_smaller_group_is_rejected_before_writes() {
+        rejects_roster(vec![device(9)], 1);
+    }
+
+    #[test]
+    fn retry_larger_group_is_rejected_before_writes() {
+        rejects_roster(vec![device(9), device(10), device(11)], 3);
+    }
+
+    #[test]
+    fn retry_changed_identity_is_rejected_before_writes() {
+        let mut changed = device(9);
+        changed.device_type = "Keyboard".into();
+        rejects_roster(vec![changed.clone(), changed], 0);
+    }
+
+    #[test]
+    fn complete_successful_retry_recovers_initial_group_failure() {
+        let mut calls = 0;
+        let summary = apply_color_to_devices_summary_with(
+            vec![device(1), device(2)],
+            "123456",
+            false,
+            |_, _| {
+                calls += 1;
+                if calls == 1 {
+                    Err("first pass member failed".into())
+                } else {
+                    Ok(openrgb::ApplyResult { needs_retry: false })
+                }
+            },
+            || Ok(vec![device(9), device(10)]),
+        );
+        assert_eq!(calls, 4);
+        assert!(summary.failed_devices.is_empty());
+        assert_eq!(summary.succeeded_keys, vec!["generic board::motherboard"]);
+    }
+
+    #[test]
+    fn no_retry_avoids_discovery() {
+        let summary = apply_color_to_devices_summary_with(
+            vec![device(1), device(2)],
+            "123456",
+            false,
+            |_, _| Ok(openrgb::ApplyResult { needs_retry: false }),
+            || panic!("discovery must not run"),
+        );
+        assert!(summary.failed_devices.is_empty());
+        assert_eq!(summary.succeeded_keys, vec!["generic board::motherboard"]);
+    }
+}
+
+#[cfg(test)]
+mod bulk_order_tests {
+    use super::*;
+
+    #[test]
+    fn retry_preserves_fresh_roster_write_order_across_groups() {
+        let roster = vec![
+            openrgb::OpenRgbDevice {
+                id: 1,
+                name: "Generic Board".into(),
+                device_type: "Motherboard".into(),
+            },
+            openrgb::OpenRgbDevice {
+                id: 2,
+                name: "Generic Board".into(),
+                device_type: "Keyboard".into(),
+            },
+            openrgb::OpenRgbDevice {
+                id: 3,
+                name: "Generic Board".into(),
+                device_type: "Motherboard".into(),
+            },
+        ];
+        let mut writes = Vec::new();
+        let summary = apply_color_to_devices_summary_with(
+            roster.clone(),
+            "123456",
+            false,
+            |device, _| {
+                writes.push(device.id);
+                Ok(openrgb::ApplyResult { needs_retry: true })
+            },
+            || Ok(roster),
+        );
+        assert!(summary.failed_devices.is_empty());
+        assert_eq!(writes, vec![1, 2, 3, 1, 2, 3]);
     }
 }

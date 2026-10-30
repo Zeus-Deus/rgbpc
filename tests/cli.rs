@@ -70,10 +70,15 @@ if [ "$1" = '-d' ] && [ "$2" = "$RGBPC_TEST_FAIL_DEVICE" ]; then exit 3; fi
         }
         let mut peer = Peer(
             command
-                .arg(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/tests/openrgb_stub.py"
-                ))
+                .arg(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests")
+                        .join(if mode.starts_with("solid") {
+                            "solid_sdk_peer.py"
+                        } else {
+                            "openrgb_stub.py"
+                        }),
+                )
                 .env("RGBPC_TEST_SERVER_FAIL", mode)
                 .stdout(Stdio::piped())
                 .spawn()
@@ -104,6 +109,7 @@ if [ "$1" = '-d' ] && [ "$2" = "$RGBPC_TEST_FAIL_DEVICE" ]; then exit 3; fi
             .env_remove("RGBPC_TEST_SERVER_FAIL")
             .env_remove("RGBPC_TEST_FAIL_DEVICE")
             .env("RGBPC_TEST_DEVICES", self.0.join("devices.txt"))
+            .env("RGBPC_TEST_SDK_STATE", self.0.join("sdk-state.json"))
             .env("PATH", self.0.join("bin"));
         command
     }
@@ -154,6 +160,152 @@ fn cli_color_outputs_json_and_persists_only_accepted_state() {
         commands.lines().filter(|c| c.starts_with("-d ")).count(),
         22
     );
+}
+
+#[test]
+fn server_color_finishes_noop_cli_writes_using_current_capabilities() {
+    let _serial = FAST_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    let _peer = fixture.peer("solid");
+    let output = fixture
+        .command()
+        .args(["--color", "123456", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.0.join("sdk-state.json")).unwrap()).unwrap();
+    assert_eq!(
+        state["active_mode"], 1,
+        "CLI exit zero must not leave the controller in Direct mode"
+    );
+    assert_eq!(state["static_color_mode"], 1);
+    assert_eq!(
+        state["brightness"], 8,
+        "Unrelated mode settings must be preserved"
+    );
+    assert_eq!(state["colors"], serde_json::json!(["123456", "123456"]));
+    assert_eq!(state["mode_writes"], 1);
+    assert_eq!(state["color_writes"], 1);
+    let commands = fs::read_to_string(fixture.0.join("commands.log")).unwrap();
+    assert_eq!(
+        commands.lines().filter(|c| c.starts_with("-d ")).count(),
+        22
+    );
+}
+
+#[test]
+fn server_ignoring_color_writes_does_not_persist_false_success() {
+    let _serial = FAST_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    let path = fixture.0.join("config/rgbpc/config.toml");
+    let before = fs::read(&path).unwrap();
+    let _peer = fixture.peer("solid-ignore");
+    let output = fixture
+        .command()
+        .args(["--color", "abcdef", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["accepted_devices"], serde_json::json!([]));
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn last_pass_failed_readback_cannot_keep_first_pass_success() {
+    let _serial = FAST_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    let path = fixture.0.join("config/rgbpc/config.toml");
+    let before = fs::read(&path).unwrap();
+    let _peer = fixture.peer("solid-second-ignore");
+    let output = fixture
+        .command()
+        .args(["--color", "abcdef", "--json"])
+        .output()
+        .unwrap();
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.0.join("sdk-state.json")).unwrap()).unwrap();
+    assert_eq!(
+        state["readbacks"][0]["active_mode"], 1,
+        "first pass must really reach its supported state"
+    );
+    assert_eq!(
+        state["readbacks"][1]["active_mode"], 0,
+        "second pass must fail its postcondition"
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["accepted_devices"], serde_json::json!([]));
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn identical_controller_success_cannot_hide_another_instances_failed_readback() {
+    let _serial = FAST_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.join("devices.txt"),
+        "0: MSI Test Board\n  Type: Motherboard\n1: MSI Test Board\n  Type: Motherboard\n",
+    )
+    .unwrap();
+    let path = fixture.0.join("config/rgbpc/config.toml");
+    let before = fs::read(&path).unwrap();
+    let _peer = fixture.peer("solid-duplicates");
+    let output = fixture
+        .command()
+        .args(["--color", "abcdef", "--json"])
+        .output()
+        .unwrap();
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.0.join("sdk-state.json")).unwrap()).unwrap();
+    assert_eq!(state["devices"][0]["active_mode"], 0);
+    assert_eq!(state["devices"][1]["active_mode"], 1);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["accepted_devices"], serde_json::json!([]));
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn late_version_reply_does_not_waive_the_last_pass_readback() {
+    let _serial = FAST_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    let path = fixture.0.join("config/rgbpc/config.toml");
+    let before = fs::read(&path).unwrap();
+    let _peer = fixture.peer("solid-late-version");
+    let output = fixture
+        .command()
+        .args(["--color", "abcdef", "--json"])
+        .output()
+        .unwrap();
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.0.join("sdk-state.json")).unwrap()).unwrap();
+    assert_eq!(state["readbacks"][0]["active_mode"], 1);
+    assert_eq!(state["active_mode"], 0);
+    assert_eq!(state["late_version_replies"], 1);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["accepted_devices"], serde_json::json!([]));
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn wrong_controller_reply_is_rejected_before_sdk_writes() {
+    let _serial = FAST_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    let _peer = fixture.peer("solid-wrong-device");
+    let output = fixture
+        .command()
+        .args(["--color", "abcdef", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.0.join("sdk-state.json")).unwrap()).unwrap();
+    assert_eq!(state["mode_writes"], 0);
+    assert_eq!(state["color_writes"], 0);
 }
 
 #[test]

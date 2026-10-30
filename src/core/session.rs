@@ -1,4 +1,4 @@
-//! Scoped OpenRGB server transport. Device commands still use the CLI.
+//! Scoped OpenRGB transport with CLI compatibility commands and checked finishing.
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, Stdio};
@@ -18,6 +18,33 @@ pub(super) fn validate_transport() -> Result<(), String> {
     if super::openrgb::server_mode() {
         super::sdk::probe(LOCAL_SERVER.parse().unwrap(), Duration::from_secs(1))
             .map_err(|error| format!("{UNAVAILABLE}{error}"))?;
+    }
+    Ok(())
+}
+
+pub(super) fn finish_solid_color(
+    device: &super::openrgb::OpenRgbDevice,
+    color: &str,
+    preferred_mode: Option<&str>,
+) -> Result<(), String> {
+    if super::openrgb::server_mode() {
+        // Callers retain the whole-action lock and have just resolved live IDs.
+        // An old/unsupported SDK keeps the unchanged CLI compatibility path;
+        // a supported transaction must confirm its state before persistence.
+        super::sdk::solid::finalize_solid(
+            LOCAL_SERVER.parse().unwrap(),
+            device.id,
+            &device.name,
+            color,
+            preferred_mode,
+            Duration::from_secs(2),
+        )
+        .map_err(|error| {
+            format!(
+                "{}: OpenRGB color confirmation failed: {error}",
+                device.name
+            )
+        })?;
     }
     Ok(())
 }

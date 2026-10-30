@@ -287,6 +287,7 @@ impl App {
                     },
                     AppEvent::SyncComplete(res) => {
                         self.is_busy = false;
+                        self.config = AppConfig::load();
                         match res {
                             Ok(_) => {
                                 self.theme_color = crate::core::load_theme_color()

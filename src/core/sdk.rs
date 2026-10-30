@@ -1,70 +1,129 @@
-//! Small read-only SDK probe and capability-gated rescan, not a color backend.
+//! Bounded SDK validation, rescan, and capability-checked solid-color finishing.
+pub(super) mod solid;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
+const TIMEOUT: &str = "OpenRGB SDK operation timed out";
+
 struct Client {
     stream: TcpStream,
     deadline: Instant,
+    received_bytes: usize,
 }
 
 impl Client {
     fn connect(address: SocketAddr, timeout: Duration) -> Result<Self, String> {
+        let deadline = Instant::now() + timeout;
         let stream = TcpStream::connect_timeout(&address, timeout).map_err(|e| e.to_string())?;
+        stream.set_nodelay(true).map_err(|e| e.to_string())?;
         stream
             .set_write_timeout(Some(timeout))
             .map_err(|e| e.to_string())?;
         Ok(Self {
             stream,
-            deadline: Instant::now() + timeout,
+            deadline,
+            received_bytes: 0,
         })
     }
 
     fn send(&mut self, id: u32, body: &[u8]) -> Result<(), String> {
-        let mut header = Vec::from(*b"ORGB");
-        header.extend_from_slice(&0u32.to_le_bytes());
-        header.extend_from_slice(&id.to_le_bytes());
-        header.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        self.stream
-            .write_all(&header)
-            .and_then(|_| self.stream.write_all(body))
-            .map_err(|e| e.to_string())
+        self.send_to(0, id, body)
+    }
+
+    fn send_to(&mut self, device: u32, id: u32, body: &[u8]) -> Result<(), String> {
+        if body.len() > 1_048_576 {
+            return Err("OpenRGB SDK request exceeds size limit".to_string());
+        }
+        let mut packet = Vec::from(*b"ORGB");
+        packet.extend_from_slice(&device.to_le_bytes());
+        packet.extend_from_slice(&id.to_le_bytes());
+        packet.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        packet.extend_from_slice(body);
+        let mut offset = 0;
+        while offset < packet.len() {
+            self.stream
+                .set_write_timeout(Some(self.remaining()?))
+                .map_err(|e| e.to_string())?;
+            match self.stream.write(&packet[offset..]) {
+                Ok(0) => return Err("OpenRGB SDK socket closed during write".to_string()),
+                Ok(size) => offset += size,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(Self::io_error(error)),
+            }
+        }
+        Ok(())
+    }
+
+    fn expected_for(&mut self, device: u32, expected: u32) -> Result<Vec<u8>, String> {
+        for _ in 0..128 {
+            let (reply_device, id, body) = self.receive_frame()?;
+            if id == expected {
+                if reply_device != device {
+                    return Err("OpenRGB SDK replied for a different controller".to_string());
+                }
+                return Ok(body);
+            }
+        }
+        Err("Too many unrelated OpenRGB SDK replies".to_string())
+    }
+
+    fn remaining(&self) -> Result<Duration, String> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| TIMEOUT.to_string())
+    }
+
+    fn io_error(error: std::io::Error) -> String {
+        match error.kind() {
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => TIMEOUT.to_string(),
+            _ => error.to_string(),
+        }
+    }
+
+    fn read_exact_bounded(&mut self, mut bytes: &mut [u8]) -> Result<(), String> {
+        while !bytes.is_empty() {
+            self.stream
+                .set_read_timeout(Some(self.remaining()?))
+                .map_err(|e| e.to_string())?;
+            match self.stream.read(bytes) {
+                Ok(0) => return Err("OpenRGB SDK socket closed during read".to_string()),
+                Ok(size) => {
+                    self.received_bytes += size;
+                    bytes = &mut bytes[size..];
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(Self::io_error(error)),
+            }
+        }
+        Ok(())
     }
 
     fn receive(&mut self) -> Result<(u32, Vec<u8>), String> {
-        let remaining = self
-            .deadline
-            .checked_duration_since(Instant::now())
-            .filter(|d| !d.is_zero())
-            .ok_or("OpenRGB SDK operation timed out")?;
-        self.stream
-            .set_read_timeout(Some(remaining))
-            .map_err(|e| e.to_string())?;
-        let mut header = [0; 16];
-        self.stream
-            .read_exact(&mut header)
-            .map_err(|e| e.to_string())?;
-        if &header[..4] != b"ORGB" || header[4..8] != [0; 4] {
+        let (device, id, body) = self.receive_frame()?;
+        if device != 0 {
             return Err("Invalid OpenRGB SDK reply".to_string());
         }
+        Ok((id, body))
+    }
+
+    fn receive_frame(&mut self) -> Result<(u32, u32, Vec<u8>), String> {
+        let mut header = [0; 16];
+        self.read_exact_bounded(&mut header)?;
+        if &header[..4] != b"ORGB" {
+            return Err("Invalid OpenRGB SDK reply".to_string());
+        }
+        let device = u32::from_le_bytes(header[4..8].try_into().unwrap());
         let id = u32::from_le_bytes(header[8..12].try_into().unwrap());
         let size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
-        if size > 65536 {
+        if size > 1_048_576 {
             return Err("OpenRGB SDK reply exceeds size limit".to_string());
         }
-        let remaining = self
-            .deadline
-            .checked_duration_since(Instant::now())
-            .filter(|d| !d.is_zero())
-            .ok_or("OpenRGB SDK operation timed out")?;
-        self.stream
-            .set_read_timeout(Some(remaining))
-            .map_err(|e| e.to_string())?;
         let mut body = vec![0; size];
-        self.stream
-            .read_exact(&mut body)
-            .map_err(|e| e.to_string())?;
-        Ok((id, body))
+        self.read_exact_bounded(&mut body)?;
+        Ok((device, id, body))
     }
 
     fn expected(&mut self, expected: u32) -> Result<Vec<u8>, String> {
@@ -129,6 +188,72 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[test]
+    fn sdk_deadline_is_absolute_across_partial_payload_reads() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let header = [b"ORGB".as_slice(), &[0; 8], &4u32.to_le_bytes()].concat();
+            socket.write_all(&header).unwrap();
+            for byte in 1u32.to_le_bytes() {
+                std::thread::sleep(Duration::from_millis(100));
+                if socket.write_all(&[byte]).is_err() {
+                    break;
+                }
+            }
+        });
+        let result = (|| {
+            let mut client = Client::connect(address, Duration::from_millis(300))?;
+            client.expected(0)
+        })();
+        peer.join().unwrap();
+        assert!(
+            result.is_err(),
+            "partial reads must not restart the deadline: {result:?}"
+        );
+    }
+
+    #[test]
+    fn device_packet_roundtrip_uses_the_requested_controller() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut request = [0; 20];
+            if socket.read_exact(&mut request).is_err() {
+                return None;
+            }
+            let response = [
+                b"ORGB".as_slice(),
+                &7u32.to_le_bytes(),
+                &1u32.to_le_bytes(),
+                &4u32.to_le_bytes(),
+                &42u32.to_le_bytes(),
+            ]
+            .concat();
+            socket.write_all(&response).unwrap();
+            Some(request)
+        });
+        let result = (|| {
+            let mut client = Client::connect(address, Duration::from_secs(1))?;
+            client.send_to(7, 1, &3u32.to_le_bytes())?;
+            client.expected_for(7, 1)
+        })();
+        let request = peer.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(result.unwrap(), 42u32.to_le_bytes());
+        let request = request.unwrap();
+        assert_eq!(&request[..4], b"ORGB");
+        assert_eq!(&request[4..8], &7u32.to_le_bytes());
+        assert_eq!(&request[8..12], &1u32.to_le_bytes());
+        assert_eq!(&request[12..16], &4u32.to_le_bytes());
+        assert_eq!(&request[16..], &3u32.to_le_bytes());
+    }
 
     fn rescan_peer(flags: u32) -> (SocketAddr, std::thread::JoinHandle<Vec<u32>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
