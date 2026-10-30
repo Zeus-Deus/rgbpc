@@ -37,7 +37,47 @@ Launch `rgbpc` from your terminal or application launcher. Use `j`/`k` to naviga
 
 If you are on [Omarchy](https://omarchy.org), the app will also show a **Settings** panel where you can enable automatic theme sync — colors will update across your hardware whenever you switch themes. When both startup restore and Omarchy sync are enabled, login restore uses the current Omarchy theme instead of the last manual color.
 
-For non-interactive use, `rgbpc --restore-last` runs the same startup restore path used by the autostart entry. Startup restore reapplies each remembered device's own last state instead of one shared global color.
+For non-interactive use, `rgbpc --restore-last` runs the same startup restore path used by the autostart entry. Startup restore reapplies each remembered device's own last state instead of one shared global color. Failed non-interactive actions return a nonzero exit status.
+
+### Automatic acceleration
+
+Just run `rgbpc`. It automatically reuses a local OpenRGB server or starts a temporary one, detects hardware, and runs the **same compatibility commands in the same order**. If starting its own server fails, it falls back to standalone OpenRGB. An existing but unresponsive server produces an error instead of being bypassed with competing hardware detection. Both motherboard fallback passes and the settling delay remain. There is no learned per-device command cache and no parallel hardware access.
+
+The first detection still takes time; subsequent changes in the same session avoid repeating it. RGBPC stops its own server on exit and leaves existing user-owned servers running. No permanent service is installed. Acceleration is transport-level, not specific to a case, motherboard, or fan brand; hardware support still comes from OpenRGB.
+
+The helper is **session-scoped**, not an always-running daemon: it stays available while the TUI is open and stops when RGBPC quits. A noninteractive color/sync/restore command stops its own helper when that command finishes. After a reboot, the next launch creates a fresh session; optional login restore is still a one-shot command. RGBPC never stops a server it did not start.
+
+The TUI redraws only after input, resize, or an action result, not on a repeating repaint timer. Idle RGBPC does not repeatedly rediscover hardware. OpenRGB still occupies memory and may do its own background work while the session is open; resource usage depends on its build and detected devices, so it is not a zero-resource process.
+
+The same automatic behavior applies to noninteractive commands, startup restore, and theme sync. Existing hooks need no extra flags. `--standalone` is a diagnostic escape hatch for the original direct CLI path; `--fast` remains accepted as a legacy alias for the default.
+
+Hardware actions and device-list refreshes wait for the previous action to finish. Cooperating RGBPC processes sharing the user cache serialize complete actions, including delayed retries and saved-state updates, so an old retry cannot interleave with another action. This does not coordinate third-party lighting programs or older RGBPC builds. While busy, `q`/`Esc` shows a wait message; `Ctrl+C` restores the terminal and force-quits. A force quit can interrupt another client using the temporary server.
+
+A newly started temporary server scans current hardware instead of loading a saved device roster. After changing hardware while RGBPC is open, or when reusing an existing server, press `R`: RGBPC restarts its own temporary server and rescans, or requests a capability-checked rescan from an existing server without stopping it. Older external servers that cannot confirm a rescan report a clear error rather than pretending the cached roster is fresh. Numeric device IDs are refreshed before writes; missing or ambiguous targets are rejected instead of reusing an old ID.
+
+### Case and fan controllers
+
+> Some case/fan controllers need **Motherboard / MB Sync** mode and a connected ARGB sync cable before software control works. Check the controller's manual—turning its lights off is not the same as selecting sync mode. RGBPC cannot reliably detect that physical switch setting through a motherboard ARGB header.
+
+### Noninteractive commands
+
+These commands work without opening the TUI:
+
+| Command | Action |
+|---|---|
+| `rgbpc --list-devices` | List detected IDs, names, keys, and enabled status |
+| `rgbpc --color 0080FF` | Set a solid color on all enabled devices |
+| `rgbpc --off` | Turn enabled devices off |
+| `rgbpc --rainbow` | Request a supported rainbow mode on enabled devices |
+| `rgbpc --device 'EXACT DEVICE NAME' --color 0080FF` | Target one exact name, current ID, or key from the device list |
+| `rgbpc --sync-theme` | Apply the current theme when theme sync is enabled |
+| `rgbpc --restore-last` | Restore remembered states when startup restore is enabled |
+
+`--device` can be repeated. Disabled devices are not silently overridden; missing or ambiguous selectors are errors. IDs may change after hardware detection, so use a unique listed key or exact name for repeated automation. Identical controllers sharing an identity cannot be targeted as a subset safely during compatibility retries.
+
+Add `--json` for scripts and automation, for example `rgbpc --list-devices --json` or `rgbpc --color 0080FF --json`. Output is one JSON object on stdout, with `schema_version: 1`; diagnostics use stderr. Direct color/off/rainbow and enabled theme-sync results include `ok`, `accepted_devices`, `errors`, and `verification: "command_acceptance"`. Success means command-level acceptance, **not** independent verification of physical LEDs.
+
+Exit codes: **0** for success, **1** for an operation error or partial failure, **2** for invalid arguments. Disabled theme sync/startup restore is a successful no-op. Use `rgbpc --help` for the complete argument reference.
 
 ## Hyprland Window Rules
 

@@ -1,5 +1,50 @@
 use regex::Regex;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static SERVER_MODE: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn set_server_mode(enabled: bool) {
+    SERVER_MODE.store(enabled, Ordering::SeqCst);
+}
+
+pub(super) fn server_mode() -> bool {
+    SERVER_MODE.load(Ordering::SeqCst)
+}
+
+pub(super) fn base_command() -> Command {
+    let mut command = Command::new("openrgb");
+    // A closed terminal or killed RGBPC must not leave a hardware owner.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let parent = std::process::id();
+        // Only async-signal-safe syscalls run between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent as libc::pid_t {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
+    }
+    command
+}
+
+pub(super) fn command() -> Command {
+    let mut command = base_command();
+    // A lost server must not turn a cached device ID into a raw hardware write.
+    command.arg(if server_mode() {
+        "--nodetect"
+    } else {
+        "--noautoconnect"
+    });
+    command
+}
 
 const RAINBOW_MODES: &[&str] = &["Rainbow wave", "Spectrum Cycle", "Rainbow Circle"];
 
@@ -28,7 +73,11 @@ fn normalize_key_part(value: &str) -> String {
 }
 
 pub fn list_devices() -> Result<Vec<OpenRgbDevice>, String> {
-    let output = Command::new("openrgb")
+    // Callers retain the action lock, so a cooperating owner cannot stop the
+    // server between this check and discovery/writes. Never accept an empty
+    // --nodetect roster merely because a borrowed server vanished.
+    super::session::validate_transport()?;
+    let output = command()
         .arg("--list-devices")
         .output()
         .map_err(|e| format!("Failed to execute openrgb: {}", e))?;
@@ -78,15 +127,46 @@ pub fn list_devices() -> Result<Vec<OpenRgbDevice>, String> {
 
 pub fn refresh_device_ids(devices: &mut [OpenRgbDevice]) -> Result<(), String> {
     let latest_devices = list_devices()?;
-    for device in devices {
-        if let Some(updated) = latest_devices
+    remap_device_ids(devices, &latest_devices)
+}
+
+fn remap_device_ids(
+    devices: &mut [OpenRgbDevice],
+    latest_devices: &[OpenRgbDevice],
+) -> Result<(), String> {
+    use std::collections::HashMap;
+    let mut requested = HashMap::new();
+    for device in devices.iter() {
+        *requested
+            .entry(device_profile_key(device))
+            .or_insert(0usize) += 1;
+    }
+    let mut used = HashMap::new();
+    let mut replacements = Vec::new();
+    for device in devices.iter() {
+        let key = device_profile_key(device);
+        let matches: Vec<_> = latest_devices
             .iter()
-            .find(|candidate| device_profile_key(candidate) == device_profile_key(device))
-        {
-            device.id = updated.id;
-            device.name = updated.name.clone();
-            device.device_type = updated.device_type.clone();
+            .filter(|candidate| device_profile_key(candidate) == key)
+            .collect();
+        if matches.is_empty() {
+            return Err(format!(
+                "{} is no longer present; rescan devices before applying",
+                device.name
+            ));
         }
+        if requested[&key] != matches.len() {
+            return Err(format!(
+                "{} has an ambiguous or changed controller identity; rescan before applying",
+                device.name
+            ));
+        }
+        let offset = used.entry(key).or_insert(0usize);
+        replacements.push(matches[*offset].clone());
+        *offset += 1;
+    }
+    for (device, replacement) in devices.iter_mut().zip(replacements) {
+        *device = replacement;
     }
     Ok(())
 }
@@ -351,7 +431,7 @@ fn apply_static_with_profile_save(device_id: u32, color: &str) -> Result<bool, S
 }
 
 fn run_openrgb(args: &[&str]) -> Result<bool, String> {
-    let output = Command::new("openrgb")
+    let output = command()
         .args(args)
         .output()
         .map_err(|e| format!("Failed to execute openrgb: {}", e))?;
@@ -364,10 +444,7 @@ pub fn set_rainbow(device: &OpenRgbDevice) -> Result<(), String> {
     let mut last_error = None;
 
     for mode in RAINBOW_MODES {
-        match Command::new("openrgb")
-            .args(["-d", id.as_str(), "-m", mode])
-            .output()
-        {
+        match command().args(["-d", id.as_str(), "-m", mode]).output() {
             Ok(output) if output.status.success() => return Ok(()),
             Ok(_) => {}
             Err(err) => remember_error(&mut last_error, format!("{}: {}", device.name, err)),
@@ -420,6 +497,47 @@ mod tests {
         device_profile_key, finalize_attempts, record_attempt_result, strategy_attempts_for_device,
         OpenRgbDevice, StrategyKind,
     };
+
+    #[test]
+    fn remap_rejects_missing_targets_instead_of_reusing_old_numeric_ids() {
+        let mut selected = vec![OpenRgbDevice {
+            id: 0,
+            name: "Old board".to_string(),
+            device_type: "Motherboard".to_string(),
+        }];
+        let latest = vec![OpenRgbDevice {
+            id: 0,
+            name: "New GPU".to_string(),
+            device_type: "GPU".to_string(),
+        }];
+        assert!(super::remap_device_ids(&mut selected, &latest).is_err());
+        assert_eq!(selected[0].name, "Old board");
+    }
+
+    #[test]
+    fn remap_updates_all_identical_controllers_without_collapsing_to_the_first() {
+        let mut selected = vec![
+            OpenRgbDevice {
+                id: 0,
+                name: "Hub".to_string(),
+                device_type: "LEDStrip".to_string(),
+            },
+            OpenRgbDevice {
+                id: 1,
+                name: "Hub".to_string(),
+                device_type: "LEDStrip".to_string(),
+            },
+        ];
+        let mut latest = selected.clone();
+        latest[0].id = 4;
+        latest[1].id = 6;
+        assert!(super::remap_device_ids(&mut selected, &latest).is_ok());
+        assert_eq!(
+            selected.iter().map(|d| d.id).collect::<Vec<_>>(),
+            vec![4, 6]
+        );
+        assert!(super::remap_device_ids(&mut selected[..1], &latest).is_err());
+    }
 
     #[test]
     fn device_profile_key_is_stable_for_case_and_whitespace() {

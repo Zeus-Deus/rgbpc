@@ -6,7 +6,8 @@ use crate::core::{
 };
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+        MouseEventKind,
     },
     execute,
     terminal::{
@@ -33,7 +34,6 @@ pub enum AppEvent {
     ColorSetComplete(DeviceActionSummary),
     OffComplete(DeviceActionSummary),
     RainbowComplete(DeviceActionSummary),
-    Tick,
 }
 
 #[derive(PartialEq)]
@@ -49,26 +49,21 @@ const PALETTE: &[&str] = &[
 ];
 
 pub struct App {
+    backend: crate::core::session::SharedBackend,
     config: AppConfig,
     devices: Vec<OpenRgbDevice>,
     selected_index: usize,
     status_msg: Arc<Mutex<String>>,
     theme_color: String,
-    is_syncing: bool,
+    is_busy: bool,
     mode: AppMode,
     selected_color_index: usize,
     custom_hex_input: String,
     input_active: bool,
     is_omarchy: bool,
-    pending_state_update: Option<PendingStateUpdate>,
 }
 
-#[derive(Clone)]
-struct PendingStateUpdate {
-    device_keys: Vec<String>,
-    state: SavedState,
-}
-
+#[cfg(test)]
 fn filter_device_keys(requested: &[String], succeeded: &[String]) -> Vec<String> {
     requested
         .iter()
@@ -77,13 +72,39 @@ fn filter_device_keys(requested: &[String], succeeded: &[String]) -> Vec<String>
         .collect()
 }
 
+fn with_backend_action(
+    backend: &crate::core::session::SharedBackend,
+    mut action: impl FnMut() -> DeviceActionSummary,
+) -> DeviceActionSummary {
+    crate::core::session::with_backend(backend, || {
+        let summary = action();
+        if summary.succeeded_keys.is_empty()
+            && summary.failed_devices.len() == 1
+            && crate::core::session::is_unavailable(&summary.failed_devices[0])
+        {
+            Err(summary.failed_devices[0].clone())
+        } else {
+            Ok(summary)
+        }
+    })
+    .unwrap_or_else(|error| DeviceActionSummary {
+        succeeded_keys: Vec::new(),
+        failed_devices: vec![error],
+    })
+}
+
 fn format_sync_scope(count: usize) -> String {
     format!("{} device{}", count, if count == 1 { "" } else { "s" })
 }
 
 impl App {
-    pub fn new() -> Self {
-        let devices = openrgb::list_devices().unwrap_or_default();
+    pub fn new(backend: crate::core::session::SharedBackend) -> Self {
+        let (devices, startup_error) = match crate::core::session::with_backend(&backend, || {
+            crate::core::with_hardware_lock(openrgb::list_devices)
+        }) {
+            Ok(devices) => (devices, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
         let config = AppConfig::load();
 
         let mut omarchy_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
@@ -93,22 +114,24 @@ impl App {
         let hex_color = crate::core::load_theme_color().unwrap_or_else(|_| String::from("7aa2f7"));
 
         Self {
+            backend,
             config,
             devices,
             selected_index: 0,
-            status_msg: Arc::new(Mutex::new(if is_omarchy {
+            status_msg: Arc::new(Mutex::new(if let Some(error) = startup_error {
+                format!("Could not load devices: {error}")
+            } else if is_omarchy {
                 "Press 'a' toggle startup restore for the whole remembered setup, 's' toggle Sync, 'Enter'/'Space' toggle Device, 'c' set color for all enabled, 't' Force sync all enabled, 'R' rescan, 'r' rainbow, 'o' off, 'q' quit.".to_string()
             } else {
                 "Press 'a' toggle startup restore for the whole remembered setup, 'Enter'/'Space' toggle Device, 'c' set color for all enabled, 'R' rescan, 'r' rainbow, 'o' off, 'q' quit.".to_string()
             })),
             theme_color: hex_color,
-            is_syncing: false,
+            is_busy: false,
             mode: AppMode::Normal,
             selected_color_index: 0,
             custom_hex_input: String::new(),
             input_active: false,
             is_omarchy,
-            pending_state_update: None,
         }
     }
 
@@ -125,14 +148,6 @@ impl App {
         let mut terminal = Terminal::new(backend)?;
 
         let (tx, rx) = mpsc::channel();
-
-        let tx_tick = tx.clone();
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_millis(100));
-            if tx_tick.send(AppEvent::Tick).is_err() {
-                break;
-            }
-        });
 
         let res = self.run_app(&mut terminal, tx, rx);
 
@@ -153,15 +168,30 @@ impl App {
         tx: mpsc::Sender<AppEvent>,
         rx: mpsc::Receiver<AppEvent>,
     ) -> io::Result<()> {
+        let mut needs_redraw = true;
         loop {
-            terminal.draw(|f| self.ui(f))?;
+            if needs_redraw {
+                terminal.draw(|f| self.ui(f))?;
+                needs_redraw = false;
+            }
 
             if event::poll(Duration::from_millis(50))? {
+                needs_redraw = true;
                 match event::read()? {
                     Event::Key(key) => {
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            return Err(io::Error::new(io::ErrorKind::Interrupted, "Force quit"));
+                        }
                         if self.mode == AppMode::Normal {
                             match key.code {
-                                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                                KeyCode::Char('q') | KeyCode::Esc => {
+                                    if !self.is_busy {
+                                        return Ok(());
+                                    }
+                                    *self.status_msg.lock().unwrap() = "Still applying. Wait for completion, or Ctrl+C to force quit.".to_string();
+                                }
                                 KeyCode::Down | KeyCode::Char('j') => self.next(),
                                 KeyCode::Up | KeyCode::Char('k') => self.previous(),
                                 KeyCode::Enter | KeyCode::Char(' ') => self.toggle_current(),
@@ -245,6 +275,8 @@ impl App {
             }
 
             while let Ok(app_event) = rx.try_recv() {
+                self.is_busy = false;
+                needs_redraw = true;
                 match app_event {
                     AppEvent::DevicesReloaded(result) => match result {
                         Ok(devices) => self.finish_reload_devices(devices),
@@ -254,12 +286,13 @@ impl App {
                         }
                     },
                     AppEvent::SyncComplete(res) => {
-                        self.is_syncing = false;
+                        self.is_busy = false;
                         match res {
                             Ok(_) => {
                                 self.theme_color = crate::core::load_theme_color()
                                     .unwrap_or_else(|_| self.theme_color.clone());
-                                *self.status_msg.lock().unwrap() = "Sync complete!".to_string()
+                                *self.status_msg.lock().unwrap() =
+                                    "Sync commands accepted.".to_string()
                             }
                             Err(e) => {
                                 *self.status_msg.lock().unwrap() = format!("Sync failed: {}", e)
@@ -268,19 +301,10 @@ impl App {
                     }
                     AppEvent::ColorSetComplete(result) => match result {
                         summary if summary.is_any_success() => {
-                            if let Some(update) = self.pending_state_update.take() {
-                                let successful_keys = filter_device_keys(
-                                    &update.device_keys,
-                                    &summary.succeeded_keys,
-                                );
-                                self.config
-                                    .set_saved_state_for_devices(&successful_keys, update.state);
-                                self.config.remove_omarchy_sync_devices(&successful_keys);
-                                let _ = self.config.save();
-                            }
+                            self.config = AppConfig::load();
                             *self.status_msg.lock().unwrap() = if summary.failed_devices.is_empty()
                             {
-                                "Color applied successfully!".to_string()
+                                "Color commands accepted.".to_string()
                             } else {
                                 format!(
                                     "Color applied to {} device(s); some failed: {}",
@@ -290,7 +314,6 @@ impl App {
                             }
                         }
                         summary => {
-                            self.pending_state_update = None;
                             *self.status_msg.lock().unwrap() = format!(
                                 "Failed to apply color: {}",
                                 summary.failed_devices.join(" | ")
@@ -300,19 +323,10 @@ impl App {
                     },
                     AppEvent::OffComplete(result) => match result {
                         summary if summary.is_any_success() => {
-                            if let Some(update) = self.pending_state_update.take() {
-                                let successful_keys = filter_device_keys(
-                                    &update.device_keys,
-                                    &summary.succeeded_keys,
-                                );
-                                self.config
-                                    .set_saved_state_for_devices(&successful_keys, update.state);
-                                self.config.remove_omarchy_sync_devices(&successful_keys);
-                                let _ = self.config.save();
-                            }
+                            self.config = AppConfig::load();
                             *self.status_msg.lock().unwrap() = if summary.failed_devices.is_empty()
                             {
-                                "Lights turned off!".to_string()
+                                "Off commands accepted.".to_string()
                             } else {
                                 format!(
                                     "Lights turned off on {} device(s); some failed: {}",
@@ -322,7 +336,6 @@ impl App {
                             };
                         }
                         summary => {
-                            self.pending_state_update = None;
                             *self.status_msg.lock().unwrap() = format!(
                                 "Failed to turn off lights: {}",
                                 summary.failed_devices.join(" | ")
@@ -331,16 +344,7 @@ impl App {
                     },
                     AppEvent::RainbowComplete(result) => match result {
                         summary if summary.is_any_success() => {
-                            if let Some(update) = self.pending_state_update.take() {
-                                let successful_keys = filter_device_keys(
-                                    &update.device_keys,
-                                    &summary.succeeded_keys,
-                                );
-                                self.config
-                                    .set_saved_state_for_devices(&successful_keys, update.state);
-                                self.config.remove_omarchy_sync_devices(&successful_keys);
-                                let _ = self.config.save();
-                            }
+                            self.config = AppConfig::load();
                             *self.status_msg.lock().unwrap() = if summary.failed_devices.is_empty()
                             {
                                 "Rainbow mode command sent!".to_string()
@@ -353,20 +357,21 @@ impl App {
                             };
                         }
                         summary => {
-                            self.pending_state_update = None;
                             *self.status_msg.lock().unwrap() = format!(
                                 "Failed to set rainbow mode: {}",
                                 summary.failed_devices.join(" | ")
                             );
                         }
                     },
-                    AppEvent::Tick => {}
                 }
             }
         }
     }
 
     fn open_color_picker(&mut self) {
+        if self.is_busy {
+            return;
+        }
         if self.devices.is_empty() {
             *self.status_msg.lock().unwrap() = "No devices to apply color to.".to_string();
             return;
@@ -387,13 +392,18 @@ impl App {
     }
 
     fn reload_devices(&mut self, tx: &mpsc::Sender<AppEvent>) {
-        *self.status_msg.lock().unwrap() = "Rescanning OpenRGB devices...".to_string();
+        if self.is_busy {
+            return;
+        }
+        self.is_busy = true;
+        *self.status_msg.lock().unwrap() = "Refreshing OpenRGB device list...".to_string();
         let tx_clone = tx.clone();
+        let backend = self.backend.clone();
         thread::spawn(move || {
-            let mut result = crate::core::openrgb::list_devices();
-            if let Ok(devices) = result.as_mut() {
-                let _ = crate::core::openrgb::refresh_device_ids(devices);
-            }
+            let result = backend
+                .lock()
+                .map_err(|_| "RGB backend lock was poisoned".to_string())
+                .and_then(|mut backend| backend.rescan());
             let _ = tx_clone.send(AppEvent::DevicesReloaded(result));
         });
     }
@@ -427,24 +437,30 @@ impl App {
     }
 
     fn force_sync(&mut self, tx: &mpsc::Sender<AppEvent>) {
-        if !self.is_syncing {
-            self.is_syncing = true;
+        if !self.is_busy {
+            self.is_busy = true;
             *self.status_msg.lock().unwrap() = "Syncing devices... please wait.".to_string();
 
             let tx_clone = tx.clone();
+            let backend = self.backend.clone();
             thread::spawn(move || {
-                let res = crate::core::perform_sync(true);
+                let res = crate::core::session::with_backend(&backend, || {
+                    crate::core::perform_sync(true)
+                });
                 let _ = tx_clone.send(AppEvent::SyncComplete(res));
             });
         }
     }
 
     fn apply_palette_color(&mut self, tx: &mpsc::Sender<AppEvent>) {
+        if self.is_busy {
+            return;
+        }
         if self.devices.is_empty() {
             return;
         }
         let color = PALETTE[self.selected_color_index].to_string();
-        let mut devices = self.enabled_devices();
+        let devices = self.enabled_devices();
         if devices.is_empty() {
             *self.status_msg.lock().unwrap() =
                 "All devices are disabled. Enable at least one device before manual color."
@@ -453,28 +469,34 @@ impl App {
             return;
         }
 
+        self.is_busy = true;
         *self.status_msg.lock().unwrap() =
             format!("Applying color #{} to all enabled devices...", color);
-        self.pending_state_update = Some(PendingStateUpdate {
-            device_keys: self.enabled_device_keys(),
-            state: SavedState::Color { hex: color.clone() },
-        });
         let tx_clone = tx.clone();
+        let backend = self.backend.clone();
         thread::spawn(move || {
-            let _ = openrgb::refresh_device_ids(&mut devices);
-            let res = crate::core::apply_color_to_devices_summary(devices, &color, true);
+            let res = with_backend_action(&backend, || {
+                crate::core::apply_color_to_selected_devices_summary(
+                    devices.clone(),
+                    &color,
+                    SavedState::Color { hex: color.clone() },
+                )
+            });
             let _ = tx_clone.send(AppEvent::ColorSetComplete(res));
         });
         self.mode = AppMode::Normal;
     }
 
     fn apply_custom_color(&mut self, tx: &mpsc::Sender<AppEvent>) {
+        if self.is_busy {
+            return;
+        }
         if self.devices.is_empty() {
             return;
         }
         if self.custom_hex_input.len() == 6 {
             let color = self.custom_hex_input.clone();
-            let mut devices = self.enabled_devices();
+            let devices = self.enabled_devices();
             if devices.is_empty() {
                 *self.status_msg.lock().unwrap() =
                     "All devices are disabled. Enable at least one device before manual color."
@@ -483,16 +505,19 @@ impl App {
                 return;
             }
 
+            self.is_busy = true;
             *self.status_msg.lock().unwrap() =
                 format!("Applying custom color #{} to all enabled devices...", color);
-            self.pending_state_update = Some(PendingStateUpdate {
-                device_keys: self.enabled_device_keys(),
-                state: SavedState::Color { hex: color.clone() },
-            });
             let tx_clone = tx.clone();
+            let backend = self.backend.clone();
             thread::spawn(move || {
-                let _ = openrgb::refresh_device_ids(&mut devices);
-                let res = crate::core::apply_color_to_devices_summary(devices, &color, true);
+                let res = with_backend_action(&backend, || {
+                    crate::core::apply_color_to_selected_devices_summary(
+                        devices.clone(),
+                        &color,
+                        SavedState::Color { hex: color.clone() },
+                    )
+                });
                 let _ = tx_clone.send(AppEvent::ColorSetComplete(res));
             });
             self.mode = AppMode::Normal;
@@ -625,6 +650,9 @@ impl App {
     }
 
     fn toggle_current(&mut self) {
+        if self.is_busy {
+            return;
+        }
         if self.devices.is_empty() {
             return;
         }
@@ -643,6 +671,9 @@ impl App {
     }
 
     fn toggle_sync(&mut self) {
+        if self.is_busy {
+            return;
+        }
         let enable_sync = !self.config.omarchy_sync_enabled;
         if enable_sync {
             if let Err(e) = hook::install_hook() {
@@ -670,6 +701,9 @@ impl App {
     }
 
     fn toggle_restore_on_startup(&mut self) {
+        if self.is_busy {
+            return;
+        }
         let enable_restore = !self.config.restore_on_startup;
         if enable_restore {
             if let Err(e) = hook::install_restore_autostart() {
@@ -690,45 +724,53 @@ impl App {
     }
 
     fn force_rainbow(&mut self, tx: &mpsc::Sender<AppEvent>) {
+        if self.is_busy {
+            return;
+        }
         *self.status_msg.lock().unwrap() = "Setting Rainbow mode...".to_string();
-        let mut devices = self.enabled_devices();
+        let devices = self.enabled_devices();
         if devices.is_empty() {
             *self.status_msg.lock().unwrap() =
                 "All devices are disabled. Enable at least one device first.".to_string();
             return;
         }
 
-        self.pending_state_update = Some(PendingStateUpdate {
-            device_keys: self.enabled_device_keys(),
-            state: SavedState::Rainbow,
-        });
+        self.is_busy = true;
+        let backend = self.backend.clone();
         thread::spawn({
             let tx = tx.clone();
             move || {
-                let _ = openrgb::refresh_device_ids(&mut devices);
-                let result = crate::core::set_rainbow_for_devices_summary(devices, true);
+                let result = with_backend_action(&backend, || {
+                    crate::core::set_rainbow_for_selected_devices_summary(devices.clone())
+                });
                 let _ = tx.send(AppEvent::RainbowComplete(result));
             }
         });
     }
 
     fn force_off(&mut self, tx: &mpsc::Sender<AppEvent>) {
+        if self.is_busy {
+            return;
+        }
         *self.status_msg.lock().unwrap() = "Turning off lights...".to_string();
-        let mut devices = self.enabled_devices();
+        let devices = self.enabled_devices();
         if devices.is_empty() {
             *self.status_msg.lock().unwrap() =
                 "All devices are disabled. Enable at least one device first.".to_string();
             return;
         }
 
+        self.is_busy = true;
         let tx_clone = tx.clone();
-        self.pending_state_update = Some(PendingStateUpdate {
-            device_keys: self.enabled_device_keys(),
-            state: SavedState::Off,
-        });
+        let backend = self.backend.clone();
         thread::spawn(move || {
-            let _ = openrgb::refresh_device_ids(&mut devices);
-            let result = crate::core::apply_color_to_devices_summary(devices, "000000", true);
+            let result = with_backend_action(&backend, || {
+                crate::core::apply_color_to_selected_devices_summary(
+                    devices.clone(),
+                    "000000",
+                    SavedState::Off,
+                )
+            });
             let _ = tx_clone.send(AppEvent::OffComplete(result));
         });
     }
@@ -978,8 +1020,36 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::filter_device_keys;
+    use super::{filter_device_keys, App, AppMode};
     use crate::core::config::AppConfig;
+    use std::sync::{mpsc, Arc, Mutex};
+
+    #[test]
+    fn busy_manual_actions_cannot_replace_a_running_operation() {
+        // No devices: the regression can exercise the real dispatch methods
+        // without spawning a process or touching the machine's lighting.
+        let mut app = App {
+            backend: Arc::new(Mutex::new(crate::core::session::Backend::new(false))),
+            config: AppConfig::default(),
+            devices: Vec::new(),
+            selected_index: 0,
+            status_msg: Arc::new(Mutex::new("Existing operation".to_string())),
+            theme_color: "ffffff".to_string(),
+            is_busy: true,
+            mode: AppMode::Normal,
+            selected_color_index: 0,
+            custom_hex_input: String::new(),
+            input_active: false,
+            is_omarchy: false,
+        };
+        let (tx, _rx) = mpsc::channel();
+        app.force_off(&tx);
+        assert_eq!(*app.status_msg.lock().unwrap(), "Existing operation");
+        app.force_rainbow(&tx);
+        assert_eq!(*app.status_msg.lock().unwrap(), "Existing operation");
+        app.open_color_picker();
+        assert_eq!(*app.status_msg.lock().unwrap(), "Existing operation");
+    }
 
     #[test]
     fn startup_restore_toggle_defaults_off() {

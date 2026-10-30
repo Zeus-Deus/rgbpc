@@ -1,9 +1,12 @@
 pub mod config;
 pub mod hook;
 pub mod openrgb;
+mod sdk;
+pub mod session;
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -256,10 +259,171 @@ mod tests {
     }
 }
 
+pub(crate) fn hardware_lock() -> Result<File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let directory = dirs::cache_dir()
+        .ok_or_else(|| "Could not determine the user cache directory".to_string())?
+        .join("rgbpc");
+    fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(directory.join("hardware.lock"))
+        .map_err(|e| format!("Could not open RGBPC hardware lock: {e}"))?;
+    loop {
+        // Lock the complete action, including its delayed retry, not each CLI
+        // command individually. Closing this File releases the advisory lock.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!("Could not lock RGBPC hardware: {error}"));
+        }
+    }
+}
+
+pub fn with_hardware_lock<T>(action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let _lock = hardware_lock()?;
+    action()
+}
+
+pub fn select_devices(
+    devices: &[openrgb::OpenRgbDevice],
+    selectors: &[String],
+    config: &AppConfig,
+    writable: bool,
+) -> Result<Vec<openrgb::OpenRgbDevice>, String> {
+    let enabled = |device: &openrgb::OpenRgbDevice| {
+        !config.is_device_disabled(&openrgb::device_profile_key(device), &device.name)
+    };
+    if selectors.is_empty() {
+        return Ok(devices
+            .iter()
+            .filter(|device| !writable || enabled(device))
+            .cloned()
+            .collect());
+    }
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    for selector in selectors {
+        let matches: Vec<_> = devices
+            .iter()
+            .filter(|device| {
+                selector == &device.id.to_string()
+                    || selector == &device.name
+                    || selector == &openrgb::device_profile_key(device)
+            })
+            .collect();
+        if matches.len() != 1 {
+            return Err(format!("Device selector {selector:?} matched {} devices; use an exact ID, name, or key from --list-devices", matches.len()));
+        }
+        let device = matches[0];
+        if writable && !enabled(device) {
+            return Err(format!(
+                "{} is disabled in RGBPC; enable it before changing its lighting",
+                device.name
+            ));
+        }
+        if seen.insert(device.id) {
+            selected.push(device.clone());
+        }
+    }
+    Ok(selected)
+}
+
+pub fn manual_cli_action(
+    state: SavedState,
+    selectors: &[String],
+) -> Result<DeviceActionSummary, String> {
+    let _lock = hardware_lock()?;
+    let config = AppConfig::load();
+    let current = openrgb::list_devices()?;
+    let devices = select_devices(&current, selectors, &config, true)?;
+    if devices.is_empty() {
+        return Err("No enabled OpenRGB devices were selected".to_string());
+    }
+    // Retries resolve by profile identity. Never let a subset of identical
+    // controllers accidentally broaden to all matching controllers on retry.
+    for device in &devices {
+        let key = openrgb::device_profile_key(device);
+        let total = current
+            .iter()
+            .filter(|d| openrgb::device_profile_key(d) == key)
+            .count();
+        let selected = devices
+            .iter()
+            .filter(|d| openrgb::device_profile_key(d) == key)
+            .count();
+        if selected != total {
+            return Err(format!("{} has an ambiguous controller identity; cannot safely target only part of this identical-controller group", device.name));
+        }
+    }
+    let mut summary = match &state {
+        SavedState::Color { hex } => apply_color_to_devices_summary(devices, hex, true),
+        SavedState::Off => apply_color_to_devices_summary(devices, "000000", true),
+        SavedState::Rainbow => set_rainbow_for_devices_summary(devices, true),
+    };
+    persist_manual_state(&mut summary, state);
+    summary.succeeded_keys.sort();
+    summary.failed_devices.sort();
+    Ok(summary)
+}
+
+pub fn apply_color_to_selected_devices_summary(
+    mut devices: Vec<openrgb::OpenRgbDevice>,
+    color: &str,
+    state: SavedState,
+) -> DeviceActionSummary {
+    with_hardware_lock(|| {
+        openrgb::refresh_device_ids(&mut devices)?;
+        let mut summary = apply_color_to_devices_summary(devices, color, true);
+        persist_manual_state(&mut summary, state);
+        Ok(summary)
+    })
+    .unwrap_or_else(|error| DeviceActionSummary::from_counts(Vec::new(), vec![error]))
+}
+
+pub fn set_rainbow_for_selected_devices_summary(
+    mut devices: Vec<openrgb::OpenRgbDevice>,
+) -> DeviceActionSummary {
+    with_hardware_lock(|| {
+        openrgb::refresh_device_ids(&mut devices)?;
+        let mut summary = set_rainbow_for_devices_summary(devices, true);
+        persist_manual_state(&mut summary, SavedState::Rainbow);
+        Ok(summary)
+    })
+    .unwrap_or_else(|error| DeviceActionSummary::from_counts(Vec::new(), vec![error]))
+}
+
+fn persist_manual_state(summary: &mut DeviceActionSummary, state: SavedState) {
+    if !summary.is_any_success() {
+        return;
+    }
+    // Called while the complete hardware action still owns the lock. Read the
+    // current config, not the TUI snapshot from before another hook completed.
+    let mut config = AppConfig::load();
+    config.set_saved_state_for_devices(&summary.succeeded_keys, state);
+    config.remove_omarchy_sync_devices(&summary.succeeded_keys);
+    if let Err(error) = config.save() {
+        summary
+            .failed_devices
+            .push(format!("Could not save RGB state: {error}"));
+    }
+}
+
 pub fn perform_sync(force: bool) -> Result<(), String> {
+    perform_sync_summary(force)?.into_result()
+}
+
+pub fn perform_sync_summary(force: bool) -> Result<DeviceActionSummary, String> {
+    let _lock = hardware_lock()?;
     let mut conf = AppConfig::load();
     if !conf.omarchy_sync_enabled && !force {
-        return Ok(());
+        return Ok(DeviceActionSummary::from_counts(Vec::new(), Vec::new()));
     }
 
     // Existing 3.x installations may invoke us from the former flat hook. Migrate
@@ -270,15 +434,14 @@ pub fn perform_sync(force: bool) -> Result<(), String> {
 
     let hex_color = load_theme_color()?;
 
-    let mut devices = openrgb::list_devices()?;
-    let _ = openrgb::refresh_device_ids(&mut devices);
+    let devices = openrgb::list_devices()?;
 
     let enabled_devices: Vec<_> = devices
         .into_iter()
         .filter(|device| sync_target_contains(&conf, device))
         .collect();
 
-    let summary = apply_color_to_devices_summary(enabled_devices, &hex_color, true);
+    let mut summary = apply_color_to_devices_summary(enabled_devices, &hex_color, true);
 
     if summary.is_any_success() {
         conf.set_saved_state_for_devices(
@@ -287,13 +450,18 @@ pub fn perform_sync(force: bool) -> Result<(), String> {
                 hex: hex_color.clone(),
             },
         );
-        let _ = conf.save();
+        if let Err(error) = conf.save() {
+            summary
+                .failed_devices
+                .push(format!("Could not save RGB state: {error}"));
+        }
     }
 
-    summary.into_result()
+    Ok(summary)
 }
 
-pub fn perform_restore() -> Result<(), String> {
+pub fn perform_restore(fast: bool) -> Result<(), String> {
+    let _lock = hardware_lock()?;
     let conf = AppConfig::load();
     if !conf.restore_on_startup {
         return Ok(());
@@ -311,6 +479,23 @@ pub fn perform_restore() -> Result<(), String> {
             thread::sleep(Duration::from_millis(1000));
         }
 
+        // Honor login delay and enabled/state checks before detecting hardware.
+        // A failed outer attempt gets a fresh server/detection next time.
+        let _session = if fast {
+            match session::OpenRgbSession::start_locked() {
+                Ok(session) => session,
+                Err(error) => {
+                    openrgb::set_server_mode(false);
+                    if session::is_unavailable(&error) {
+                        return Err(error);
+                    }
+                    eprintln!("Fast mode unavailable: {error}. Using standalone OpenRGB.");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         match restore_once(&conf) {
             Ok(()) => return Ok(()),
             Err(err) => last_error = Some(err),
@@ -321,12 +506,10 @@ pub fn perform_restore() -> Result<(), String> {
 }
 
 fn restore_once(conf: &AppConfig) -> Result<(), String> {
-    let mut devices = openrgb::list_devices()?;
+    let devices = openrgb::list_devices()?;
     if devices.is_empty() {
         return Err("No OpenRGB devices available for startup restore".to_string());
     }
-
-    let _ = openrgb::refresh_device_ids(&mut devices);
 
     let mut omarchy_devices = Vec::new();
     let mut saved_state_devices = Vec::new();
@@ -527,10 +710,9 @@ fn retry_color_for_profile_keys(
 
     thread::sleep(Duration::from_millis(1500));
 
-    let Ok(mut devices) = openrgb::list_devices() else {
+    let Ok(devices) = openrgb::list_devices() else {
         return;
     };
-    let _ = openrgb::refresh_device_ids(&mut devices);
 
     for device in devices {
         let key = openrgb::device_profile_key(&device);
@@ -583,7 +765,7 @@ pub fn set_rainbow_for_devices_summary(
 
 impl DeviceActionSummary {
     fn into_result(self) -> Result<(), String> {
-        if self.failed_devices.is_empty() || self.is_any_success() {
+        if self.failed_devices.is_empty() {
             Ok(())
         } else {
             Err(self.failed_devices.join(" | "))
@@ -599,6 +781,63 @@ mod restore_tests {
     };
     use crate::core::config::SavedState;
     use crate::core::openrgb::OpenRgbDevice;
+
+    #[test]
+    fn cli_selector_never_broadens_a_missing_or_disabled_target() {
+        let devices = vec![OpenRgbDevice {
+            id: 7,
+            name: "Generic Board".to_string(),
+            device_type: "Motherboard".to_string(),
+        }];
+        let mut config = AppConfig::default();
+        assert!(super::select_devices(&devices, &["missing".to_string()], &config, true).is_err());
+        assert!(super::select_devices(&devices, &["07".to_string()], &config, true).is_err());
+        config.disabled_devices.insert("Generic Board".to_string());
+        assert!(super::select_devices(&devices, &["7".to_string()], &config, true).is_err());
+        assert_eq!(
+            super::select_devices(&devices, &[], &config, false)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(super::select_devices(&devices, &[], &config, true)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn cli_selector_is_exact_deduplicated_and_ambiguity_is_an_error() {
+        let devices = vec![
+            OpenRgbDevice {
+                id: 7,
+                name: "Board".to_string(),
+                device_type: "Motherboard".to_string(),
+            },
+            OpenRgbDevice {
+                id: 8,
+                name: "Board Pro".to_string(),
+                device_type: "Motherboard".to_string(),
+            },
+        ];
+        let config = AppConfig::default();
+        let selected = super::select_devices(
+            &devices,
+            &[
+                "Board".to_string(),
+                "7".to_string(),
+                "board::motherboard".to_string(),
+            ],
+            &config,
+            true,
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, 7);
+        assert!(super::select_devices(&devices, &["board".to_string()], &config, true).is_err());
+        let mut ambiguous = devices;
+        ambiguous[1].name = "Board".to_string();
+        assert!(super::select_devices(&ambiguous, &["Board".to_string()], &config, true).is_err());
+    }
 
     #[test]
     fn apply_color_to_devices_succeeds_for_empty_list() {
