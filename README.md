@@ -81,6 +81,8 @@ These commands work without opening the TUI:
 
 In the TUI, `t` explicitly applies the current theme to the currently enabled devices, including after a manual color change. Automatic theme hooks still use their separately saved sync scope; a one-shot force sync does not silently add devices to that scope.
 
+For automatic theme changes, use `s` to enable sync for the currently enabled devices. Choosing a manual color, off, or rainbow takes the affected devices out of automatic sync so future theme changes do not overwrite that manual choice. To put them back under automatic control, toggle sync off and on with `s`. Pressing `t` alone does not enable automatic tracking.
+
 Add `--json` for scripts and automation, for example `rgbpc --list-devices --json` or `rgbpc --color 0080FF --json`. Output is one JSON object on stdout, with `schema_version: 1`; diagnostics use stderr. Direct color/off/rainbow and enabled theme-sync results include `ok`, `accepted_devices`, `errors`, and `verification: "command_acceptance"`. Success means command-level acceptance, **not** independent verification of physical LEDs.
 
 Exit codes: **0** for success, **1** for an operation error or partial failure, **2** for invalid arguments. Disabled theme sync/startup restore is a successful no-op. Use `rgbpc --help` for the complete argument reference.
