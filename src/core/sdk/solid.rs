@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 const MAX_METADATA: usize = 1024 * 1024;
+const HAS_SPEED: u32 = 1;
 const PER_LED: u32 = 1 << 5;
 const MODE_SPECIFIC: u32 = 1 << 6;
 
@@ -49,6 +50,10 @@ struct Mode {
     name: String,
     flags: u32,
     selector_at: usize,
+    speed_at: usize,
+    speed_min: u32,
+    speed_max: u32,
+    speed: u32,
     colors_min: u32,
     colors_max: u32,
     colors: Vec<[u8; 4]>,
@@ -82,10 +87,14 @@ impl Descriptor {
             let name = c.string()?;
             c.u32()?; // vendor value, preserved verbatim
             let flags = c.u32()?;
-            c.take(4 * 4)?; // speed and brightness bounds
+            let speed_min = c.u32()?;
+            let speed_max = c.u32()?;
+            c.take(2 * 4)?; // brightness bounds
             let colors_min = c.u32()?;
             let colors_max = c.u32()?;
-            c.take(3 * 4)?; // speed, brightness, direction
+            let speed_at = c.at - start;
+            let speed = c.u32()?;
+            c.take(2 * 4)?; // brightness and direction
             let selector_at = c.at - start;
             c.u32()?; // current selector retained in raw
             let colors = c.colors()?;
@@ -93,6 +102,10 @@ impl Descriptor {
                 name,
                 flags,
                 selector_at,
+                speed_at,
+                speed_min,
+                speed_max,
+                speed,
                 colors_min,
                 colors_max,
                 colors,
@@ -276,6 +289,16 @@ pub(crate) fn finalize_solid(
         return Ok(true);
     }
     if update_mode {
+        // OpenRGB 1.1 validates speed even for modes without speed control.
+        // Normalize only an invalid inactive field in an already-required
+        // mode write; preserve supported speeds, brightness and no-op actions.
+        if mode.flags & HAS_SPEED == 0 {
+            let speed = mode.speed.clamp(
+                mode.speed_min.min(mode.speed_max),
+                mode.speed_min.max(mode.speed_max),
+            );
+            raw[mode.speed_at..mode.speed_at + 4].copy_from_slice(&speed.to_le_bytes());
+        }
         let mut body = vec![0; 4];
         body.extend_from_slice(&(index as u32).to_le_bytes());
         body.extend_from_slice(&raw);
@@ -412,6 +435,7 @@ mod tests {
                 .unwrap();
             let mut requests = vec![];
             let mut reads = 0;
+            let mut rejected_mode = false;
             loop {
                 let mut h = [0; 16];
                 if socket.read_exact(&mut h).is_err() {
@@ -435,13 +459,30 @@ mod tests {
                         assert_eq!(device, 7);
                         assert_eq!(body, 3u32.to_le_bytes());
                         reads += 1;
-                        Some(if reads == 1 {
+                        Some(if reads == 1 || rejected_mode {
                             before.clone()
                         } else {
                             after.clone()
                         })
                     }
-                    1101 | 1050 => {
+                    1101 => {
+                        assert_eq!(device, 7);
+                        // OpenRGB 1.1 SetModeValuesFromMode validates speed
+                        // bounds even when MODE_FLAG_HAS_SPEED is absent.
+                        let mut c = Cursor {
+                            bytes: &body[8..],
+                            at: 0,
+                        };
+                        c.string().unwrap();
+                        c.take(8).unwrap(); // vendor value and flags
+                        let min = c.u32().unwrap();
+                        let max = c.u32().unwrap();
+                        c.take(16).unwrap(); // brightness and color bounds
+                        let speed = c.u32().unwrap();
+                        rejected_mode = !(min.min(max)..=min.max(max)).contains(&speed);
+                        None
+                    }
+                    1050 => {
                         assert_eq!(device, 7);
                         None
                     }
@@ -554,6 +595,152 @@ mod tests {
             body.extend_from_slice(&desired);
             assert_eq!(requests[2].2, full_size(body));
         }
+    }
+
+    #[test]
+    fn unsupported_speed_outside_bounds_is_normalized_for_a_required_mode_write() {
+        for (min, max, speed, wanted) in [
+            (0u32, 0u32, 50u32, 0u32),
+            (2, 9, 50, 9),
+            (9, 2, 50, 9),
+            (2, 9, 0, 2),
+            (9, 2, 0, 2),
+        ] {
+            let fields = 2 + "Static".len() + 1;
+            let mut old = mode("Static", MODE_SPECIFIC | (1 << 4), 2, 1, 1, &[[0; 4]]);
+            old[fields + 8..fields + 12].copy_from_slice(&min.to_le_bytes());
+            old[fields + 12..fields + 16].copy_from_slice(&max.to_le_bytes());
+            old[fields + 32..fields + 36].copy_from_slice(&speed.to_le_bytes());
+            let mut desired = old.clone();
+            desired[fields + 32..fields + 36].copy_from_slice(&wanted.to_le_bytes());
+            let len = desired.len();
+            desired[len - 4..].copy_from_slice(&RGB);
+            let before = descriptor("GenericDevice", &[old], 0, &[[0; 4]], false);
+            let after = descriptor(
+                "GenericDevice",
+                std::slice::from_ref(&desired),
+                0,
+                &[[0; 4]],
+                false,
+            );
+            let (result, requests) = run(3, before, after, "GenericDevice", Some("Static"));
+            assert_eq!(
+                result,
+                Ok(true),
+                "server must accept mode-specific color with inactive speed {speed}, bounds {min}..{max}"
+            );
+            assert_eq!(packets(&requests), vec![40, 1, 1101, 1]);
+            let mut body = vec![0; 4];
+            u32_to(&mut body, 0);
+            body.extend_from_slice(&desired);
+            assert_eq!(
+                requests[2].2,
+                full_size(body),
+                "only desired colors and out-of-range inactive speed may change"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_inactive_and_supported_speed_fields_are_preserved() {
+        for (flags, speed, accepted) in [
+            (MODE_SPECIFIC, 5u32, true),
+            (MODE_SPECIFIC | 1, 5u32, true),
+            (MODE_SPECIFIC | 1, 50u32, false),
+        ] {
+            let fields = 2 + "Static".len() + 1;
+            let mut old = mode("Static", flags, 2, 1, 1, &[[0; 4]]);
+            old[fields + 32..fields + 36].copy_from_slice(&speed.to_le_bytes());
+            let mut desired = old.clone();
+            let len = desired.len();
+            desired[len - 4..].copy_from_slice(&RGB);
+            let before = descriptor("GenericDevice", &[old], 0, &[], false);
+            let after = descriptor(
+                "GenericDevice",
+                std::slice::from_ref(&desired),
+                0,
+                &[],
+                false,
+            );
+            let (result, requests) = run(3, before, after, "GenericDevice", Some("Static"));
+            if accepted {
+                assert_eq!(result, Ok(true));
+            } else {
+                assert!(result.unwrap_err().contains("postcondition"));
+            }
+            assert_eq!(packets(&requests), vec![40, 1, 1101, 1]);
+            let mut body = vec![0; 4];
+            u32_to(&mut body, 0);
+            body.extend_from_slice(&desired);
+            assert_eq!(requests[2].2, full_size(body), "speed must remain {speed}");
+        }
+    }
+
+    #[test]
+    fn per_led_mode_repair_normalizes_only_invalid_inactive_speed() {
+        let fields = 2 + "Static".len() + 1;
+        let mut old = mode("Static", PER_LED, 3, 0, 0, &[]);
+        old[fields + 8..fields + 16].fill(0);
+        old[fields + 32..fields + 36].copy_from_slice(&50u32.to_le_bytes());
+        let mut desired = old.clone();
+        desired[fields + 32..fields + 36].fill(0);
+        desired[fields + 44..fields + 48].copy_from_slice(&1u32.to_le_bytes());
+        let before = descriptor("GenericDevice", &[old], 0, &[[0; 4]], false);
+        let after = descriptor(
+            "GenericDevice",
+            std::slice::from_ref(&desired),
+            0,
+            &[RGB],
+            false,
+        );
+        let (result, requests) = run(3, before, after, "GenericDevice", Some("Static"));
+        assert_eq!(result, Ok(true));
+        assert_eq!(packets(&requests), vec![40, 1, 1101, 1050, 1]);
+        let mut body = vec![0; 4];
+        u32_to(&mut body, 0);
+        body.extend_from_slice(&desired);
+        assert_eq!(requests[2].2, full_size(body));
+    }
+
+    #[test]
+    fn repaired_inactive_speed_must_match_readback() {
+        let fields = 2 + "Static".len() + 1;
+        let mut old = mode("Static", MODE_SPECIFIC, 2, 1, 1, &[[0; 4]]);
+        old[fields + 8..fields + 16].fill(0);
+        old[fields + 32..fields + 36].copy_from_slice(&50u32.to_le_bytes());
+        let mut wrong = old.clone();
+        let len = wrong.len();
+        wrong[len - 4..].copy_from_slice(&RGB);
+        let before = descriptor("GenericDevice", &[old], 0, &[], false);
+        let after = descriptor("GenericDevice", &[wrong], 0, &[], false);
+        let (result, requests) = run(3, before, after, "GenericDevice", Some("Static"));
+        assert!(result.unwrap_err().contains("postcondition"));
+        assert_eq!(packets(&requests), vec![40, 1, 1101, 1]);
+        assert_eq!(
+            word(&requests[2].2[8 + fields + 32..8 + fields + 36]).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn invalid_inactive_speed_does_not_create_an_unnecessary_mode_write() {
+        let fields = 2 + "Static".len() + 1;
+        let mut unchanged = mode("Static", MODE_SPECIFIC, 2, 1, 1, &[RGB]);
+        unchanged[fields + 8..fields + 16].fill(0);
+        unchanged[fields + 32..fields + 36].copy_from_slice(&50u32.to_le_bytes());
+        let d = descriptor("GenericDevice", &[unchanged], 0, &[], false);
+        let (result, requests) = run(3, d.clone(), d, "GenericDevice", Some("Static"));
+        assert_eq!(result, Ok(true));
+        assert_eq!(packets(&requests), vec![40, 1]);
+
+        let mut unchanged = mode("Static", PER_LED, 1, 0, 0, &[]);
+        unchanged[fields + 8..fields + 16].fill(0);
+        unchanged[fields + 32..fields + 36].copy_from_slice(&50u32.to_le_bytes());
+        let before = descriptor("GenericDevice", &[unchanged.clone()], 0, &[[0; 4]], false);
+        let after = descriptor("GenericDevice", &[unchanged], 0, &[RGB], false);
+        let (result, requests) = run(3, before, after, "GenericDevice", Some("Static"));
+        assert_eq!(result, Ok(true));
+        assert_eq!(packets(&requests), vec![40, 1, 1050, 1]);
     }
 
     fn packets(requests: &[Request]) -> Vec<u32> {
